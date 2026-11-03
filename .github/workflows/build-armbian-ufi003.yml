@@ -1,11 +1,10 @@
 name: Build UFI003 OpenStick Armbian (no-modem)
 
 on:
-  # 支持手动触发 (网页点 Run workflow)
   workflow_dispatch:
     inputs:
       branch:
-        description: "内核分支 (current=6.12 稳定, edge=7.2 主线)"
+        description: "内核分支 (current=6.12, edge=7.2)"
         required: false
         default: "current"
         type: choice
@@ -21,78 +20,62 @@ on:
           - bookworm
           - noble
       build_minimal:
-        description: "最小化 rootfs (无 X/DE, 更快)"
+        description: "最小化 rootfs (更快)"
         required: false
         default: "yes"
         type: choice
         options:
           - yes
           - no
-      compile_verbose:
-        description: "详细日志 (调试时开)"
-        required: false
-        default: "no"
-        type: choice
-        options:
-          - yes
-          - no
 
-  # push 到 main 分支也自动触发 (防止忘记手动点)
   push:
     branches: [main]
 
-  # PR 也触发 (但只跑前几个 step 检查 patch 能不能 apply)
   pull_request:
     branches: [main]
 
 concurrency:
   group: ufi003-build-${{ github.ref }}
-  cancel-in-progress: false   # 已开始的不取消, 构建要等 1-2h
-
-# GitHub 限额提醒: 免费账户每周 2000 分钟, ubuntu runner 每 minute 算 2 分钟
-# 所以每周能跑 16 次, 每次 ~100 分钟 → 足够测 patch 冲突
+  cancel-in-progress: false
 
 env:
-  # 固定参数
   BOARD: ufi003
   KERNEL_CONFIGURE: no
   EXPERT: no
   COMPRESS_OUTPUTIMAGE: xz
-  # 运行时调优: runner 7GB RAM / 4 cores, make -j2 稳一些
   MAKEFLAGS: "-j2"
   DEBIAN_FRONTEND: noninteractive
-  # 磁盘路径
-  ARMHIAN_BUILD_DIR: ${{ github.workspace }}/armbian-build
+  ARMBIAN_BUILD_DIR: ${{ github.workspace }}/armbian-build
   OUTPUT_DIR: ${{ github.workspace }}/output
 
+# ---------------------------------------------------------------------------
+# Job 1: 依赖 + 配置 + kernel patch 预检查 (PR 时只跑这一个)
+# ---------------------------------------------------------------------------
 jobs:
-  # ================================================================
-  # Job 1: 依赖安装 + 配置准备 + kernel patch apply 快速检查
-  # ================================================================
   prepare:
     name: "prepare: deps + config + kernel patch test"
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
+    # PR 时只跑 prepare (快速反馈 patch 冲突)
+    if: github.event_name != 'pull_request' || true
+
     steps:
-      - name: Checkout our config
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show workspace layout
+      - name: Show environment
         run: |
           echo "=== Workspace ==="
           pwd
           find . -maxdepth 3 -type f | head -40
           echo ""
-          echo "=== Runner Info ==="
+          echo "=== Runner ==="
           nproc
           free -h | head -3
           df -BG /
-          uname -a
 
-      - name: Install build deps
-        # runner 已预装 qemu-user-static / binfmt-support / bsdtar / pigz / build-essential
-        # 但 device-tree-compiler / bison / flex / gcc-aarch64-linux-gnu / gcc-arm-none-eabi 通常没装
+      - name: Install deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -103,101 +86,80 @@ jobs:
               gcc-aarch64-linux-gnu gcc-arm-none-eabi libnewlib-arm-none-eabi \
               qemu-user-static qemu-user binfmt-support git gnupg2 u-boot-tools fdisk gdisk
           sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
-          echo "DONE"
 
-      - name: Clone Armbian build (shallow)
+      - name: Clone armbian/build
         run: |
-          git clone --depth 1 --branch main https://github.com/armbian/build.git "${ARMHIAN_BUILD_DIR}"
-          ls -la "${ARMHIAN_BUILD_DIR}/" | head -10
+          git clone --depth 1 --branch main https://github.com/armbian/build.git "${ARMBIAN_BUILD_DIR}"
 
       - name: Install our config into armbian/build
         run: |
           mkdir -p \
-              "${ARMHIAN_BUILD_DIR}/config/boards" \
-              "${ARMHIAN_BUILD_DIR}/config/sources/families" \
-              "${ARMHIAN_BUILD_DIR}/config/bootscripts" \
-              "${ARMHIAN_BUILD_DIR}/config/sections" \
-              "${ARMHIAN_BUILD_DIR}/userpatches/kernel"
+              "${ARMBIAN_BUILD_DIR}/config/boards" \
+              "${ARMBIAN_BUILD_DIR}/config/sources/families" \
+              "${ARMBIAN_BUILD_DIR}/config/bootscripts" \
+              "${ARMBIAN_BUILD_DIR}/config/sections" \
+              "${ARMBIAN_BUILD_DIR}/userpatches/kernel"
 
-          cp config/boards/ufi003.csc                 "${ARMHIAN_BUILD_DIR}/config/boards/"
-          cp config/sources/families/msm8916.conf     "${ARMHIAN_BUILD_DIR}/config/sources/families/"
-          cp config/bootscripts/bootscript-msm8916.sh  "${ARMHIAN_BUILD_DIR}/config/bootscripts/"
-          cp config/sections/msm8916.config           "${ARMHIAN_BUILD_DIR}/config/sections/"
+          cp config/boards/ufi003.csc                 "${ARMBIAN_BUILD_DIR}/config/boards/"
+          cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
+          cp config/bootscripts/bootscript-msm8916.sh  "${ARMBIAN_BUILD_DIR}/config/bootscripts/"
+          cp config/sections/msm8916.config           "${ARMBIAN_BUILD_DIR}/config/sections/"
           cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
-             "${ARMHIAN_BUILD_DIR}/userpatches/kernel/"
-
-          cp msm8916-handsome-openstick-ufi003-armbian.dts "${ARMHIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
+             "${ARMBIAN_BUILD_DIR}/userpatches/kernel/"
+          cp msm8916-handsome-openstick-ufi003-armbian.dts \
+             "${ARMBIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
 
           echo ""
-          echo "=== Installed config ==="
-          find "${ARMHIAN_BUILD_DIR}/config" -type f
-          ls "${ARMHIAN_BUILD_DIR}/userpatches/kernel/"
+          echo "=== Installed ==="
+          find "${ARMBIAN_BUILD_DIR}/config" -type f
 
-      - name: Check kernel patch applies to mainline (fetch + git apply --check)
-        # 这步是轻量级预检查 — 看 patch 能不能干净 apply 到当前主线 linux-stable
-        # 只 clone 内核 + 应用 patch, 不编译, ~5 min. 避免整个 build 完才发现 patch 冲突
+      - name: Kernel patch apply test (git apply --check)
         run: |
-          sudo apt-get install -y -qq git-core bc bison flex libssl-dev libelf-dev dwarves
-
           BRANCH="${{ inputs.branch || 'current' }}"
           case "$BRANCH" in
             current) KVER="linux-6.12.y" ;;
             edge)    KVER="linux-7.2.y" ;;
             *)       KVER="linux-6.12.y" ;;
           esac
+          echo "Testing patch on $KVER ..."
 
-          echo "=== Fetching kernel branch: $KVER ==="
           cd /tmp
           git clone --depth 1 --single-branch --branch "$KVER" \
-              https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git kernel-check \
-              2>&1 | tail -3 || { echo "kernel clone failed"; exit 1; }
-          cd kernel-check
+              https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git kernel-check 2>&1 | tail -2
 
-          echo "=== Trying patch apply ==="
-          PATCH="${ARMHIAN_BUILD_DIR}/userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch"
-
-          if git apply --check "$PATCH" 2>&1; then
-              echo "✅ Patch applies cleanly to $KVER"
+          PATCH="${ARMBIAN_BUILD_DIR}/userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch"
+          if (cd kernel-check && git apply --check "$PATCH" 2>&1); then
+            echo "PATCH OK on $KVER"
           else
-              echo "❌ Patch apply FAILED on $KVER"
-              echo ""
-              echo "=== Attempting 3-way merge ==="
-              if git am --3way "$PATCH" 2>&1; then
-                  echo "✅ 3-way merge succeeded"
-                  git am --abort 2>/dev/null || true
-              else
-                  echo "❌ 3-way merge also failed"
-                  echo ""
-                  echo "这意味着 HandsomeYingyan 2022 年写的 patch 不适配主线 $KVER."
-                  echo "需要手动改 patch: modem.dtsi include 位置变了 或 节点名变了"
-                  echo ""
-                  echo "=== 建议: 用路线 B (dtc 直接编 DTS) ==="
-                  echo "在 Linux 上: dtc -I dts -O dtb -o dtb our-dts.dts"
-                  echo "然后手动替换内核编出来的 dtb."
-                  git am --abort 2>/dev/null || true
-                  exit 0   # 不 hard fail, 让用户选路线 B
-              fi
+            echo "PATCH FAILED on $KVER (3-way merge fallback attempt)"
+            (cd kernel-check && git am --3way "$PATCH" 2>&1) || echo "PATCH 3-WAY ALSO FAILED"
+            (cd kernel-check && git am --abort 2>/dev/null) || true
           fi
+          cd / && rm -rf /tmp/kernel-check
 
-  # ================================================================
-  # Job 2: 正式构建 Armbian (compile.sh)
-  # ================================================================
+  # ---------------------------------------------------------------------------
+  # Job 2: Armbian compile.sh — 正式构建
+  # ---------------------------------------------------------------------------
   build-armbian:
-    name: "build: armbian compile.sh (~60-120 min)"
+    name: "build: armbian compile.sh"
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    needs: prepare   # 依赖 prepare job 先过
+    needs: [prepare]
+    if: github.event_name != 'pull_request'
 
-    # kernel cache + ccache, 加速二次构建
+    # outputs 供 assemble job 用
+    outputs:
+      exit_code: ${{ steps.compile.outputs.exit_code }}
+      elapsed_minutes: ${{ steps.compile.outputs.elapsed_minutes }}
+
     env:
       CCACHE_DIR: ${{ github.workspace }}/ccache
-      ARMBIAN_CACHE: ${{ github.workspace }}/armbian-cache
 
     steps:
-      - name: Checkout our config
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build deps (与 prepare 相同, 独立 runner 需重装)
+      - name: Install deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -211,56 +173,45 @@ jobs:
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            ${{ env.CCACHE_DIR }}
+          path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
           restore-keys: |
             ccache-${{ runner.os }}-
 
-      - name: Clone Armbian build
+      - name: Clone armbian/build + install config
         run: |
-          git clone --depth 1 --branch main https://github.com/armbian/build.git "${ARMHIAN_BUILD_DIR}"
+          git clone --depth 1 --branch main https://github.com/armbian/build.git "${ARMBIAN_BUILD_DIR}"
 
-      - name: Install our config
-        run: |
           mkdir -p \
-              "${ARMHIAN_BUILD_DIR}/config/boards" \
-              "${ARMHIAN_BUILD_DIR}/config/sources/families" \
-              "${ARMHIAN_BUILD_DIR}/config/bootscripts" \
-              "${ARMHIAN_BUILD_DIR}/config/sections" \
-              "${ARMHIAN_BUILD_DIR}/userpatches/kernel"
+              "${ARMBIAN_BUILD_DIR}/config/boards" \
+              "${ARMBIAN_BUILD_DIR}/config/sources/families" \
+              "${ARMBIAN_BUILD_DIR}/config/bootscripts" \
+              "${ARMBIAN_BUILD_DIR}/config/sections" \
+              "${ARMBIAN_BUILD_DIR}/userpatches/kernel"
 
-          cp config/boards/ufi003.csc                 "${ARMHIAN_BUILD_DIR}/config/boards/"
-          cp config/sources/families/msm8916.conf     "${ARMHIAN_BUILD_DIR}/config/sources/families/"
-          cp config/bootscripts/bootscript-msm8916.sh  "${ARMHIAN_BUILD_DIR}/config/bootscripts/"
-          cp config/sections/msm8916.config           "${ARMHIAN_BUILD_DIR}/config/sections/"
+          cp config/boards/ufi003.csc                 "${ARMBIAN_BUILD_DIR}/config/boards/"
+          cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
+          cp config/bootscripts/bootscript-msm8916.sh  "${ARMBIAN_BUILD_DIR}/config/bootscripts/"
+          cp config/sections/msm8916.config           "${ARMBIAN_BUILD_DIR}/config/sections/"
           cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
-             "${ARMHIAN_BUILD_DIR}/userpatches/kernel/"
-          cp msm8916-handsome-openstick-ufi003-armbian.dts "${ARMHIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
+             "${ARMBIAN_BUILD_DIR}/userpatches/kernel/"
+          cp msm8916-handsome-openstick-ufi003-armbian.dts \
+             "${ARMBIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
 
-      - name: Run Armbian compile.sh
+      - name: Run compile.sh
         id: compile
         run: |
-          cd "${ARMHIAN_BUILD_DIR}"
+          cd "${ARMBIAN_BUILD_DIR}"
 
           BRANCH="${{ inputs.branch || 'current' }}"
           RELEASE="${{ inputs.release || 'bookworm' }}"
           BUILD_MINIMAL="${{ inputs.build_minimal || 'yes' }}"
-          VERBOSE="${{ inputs.compile_verbose || 'no' }}"
+          VERBOSE="no"
 
-          echo "=== Build Parameters ==="
-          echo "  BOARD=${BOARD}"
-          echo "  BRANCH=${BRANCH}"
-          echo "  RELEASE=${RELEASE}"
-          echo "  BUILD_MINIMAL=${BUILD_MINIMAL}"
-          echo "  MAKEFLAGS=${MAKEFLAGS}"
-          echo "  ccache hits will appear at end of make"
-          echo ""
+          echo "=== Parameters: BOARD=$BOARD BRANCH=$BRANCH RELEASE=$RELEASE MINIMAL=$BUILD_MINIMAL MAKEFLAGS=$MAKEFLAGS ==="
 
-          # compile.sh 会: clone 内核 + 打 patch + 编 kernel/dtb/module + debootstrap rootfs + mkfs + 打包
-          # 这步耗时最长 (40-100 min), 如果超时 6h 就会被 runner 掐掉
-          set +e   # 失败了也捕获退出码
           START_TS=$(date +%s)
+          set +e
           sudo ./compile.sh \
               BOARD="${BOARD}" \
               BRANCH="${BRANCH}" \
@@ -270,27 +221,25 @@ jobs:
               EXPERT=no \
               COMPRESS_OUTPUTIMAGE="${COMPRESS_OUTPUTIMAGE}" \
               VERBOSE="${VERBOSE}" \
-              2>&1 | tee "${ARMHIAN_BUILD_DIR}/compile.log"
+              2>&1 | tee "${ARMBIAN_BUILD_DIR}/compile.log"
           RC=$?
-          END_TS=$(date +%s)
-          ELAPSED=$(( (END_TS - START_TS) / 60 ))
           set -e
+          ELAPSED=$(( ($(date +%s) - START_TS) / 60 ))
 
+          echo "exit_code=${RC}"         >> "$GITHUB_OUTPUT"
           echo "elapsed_minutes=${ELAPSED}" >> "$GITHUB_OUTPUT"
-          echo "exit_code=${RC}" >> "$GITHUB_OUTPUT"
+
+          echo "compile.sh exit=$RC, elapsed=${ELAPSED}min"
+          echo ""
+          echo "=== Armbian output files ==="
+          find "${ARMBIAN_BUILD_DIR}/output" -type f \( -name "*.img" -o -name "*.img.xz" \) 2>/dev/null || true
 
           if [[ $RC -ne 0 ]]; then
-              echo "❌ compile.sh FAILED (exit=$RC, elapsed=${ELAPSED}min)"
-              echo ""
-              echo "=== Last 100 lines of compile.log ==="
-              tail -100 "${ARMHIAN_BUILD_DIR}/compile.log"
-              exit 1
+            echo ""
+            echo "=== compile.log tail (last 150 lines) ==="
+            tail -150 "${ARMBIAN_BUILD_DIR}/compile.log"
           fi
-
-          echo "✅ compile.sh completed in ${ELAPSED} minutes"
-          echo ""
-          echo "=== Armbian output ==="
-          find "${ARMHIAN_BUILD_DIR}/output" -name "*.img" -o -name "*.img.xz" 2>/dev/null | head -20
+          exit $RC
 
       - name: Save ccache
         if: always()
@@ -299,28 +248,30 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
 
-      - name: Upload compile log
+      # --- 关键修复: build job 上传 Armbian 产物, assemble 才能下载 ---
+      - name: Upload Armbian artifacts (rootfs img + compile.log)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compile-log-${{ github.run_number }}
+          name: armbian-build-output-${{ github.run_number }}
           path: |
-            ${{ env.ARMHIAN_BUILD_DIR }}/compile.log
+            ${{ env.ARMBIAN_BUILD_DIR }}/output/images
+            ${{ env.ARMBIAN_BUILD_DIR }}/compile.log
           retention-days: 14
           if-no-files-found: ignore
 
-  # ================================================================
-  # Job 3: 组装可烧录固件 + 静态自检 + 上传 artifact
-  # ================================================================
+  # ---------------------------------------------------------------------------
+  # Job 3: 组装 boot.img + 改 rootfs fstab + 静态自检 + 上传
+  # ---------------------------------------------------------------------------
   assemble:
-    name: "assemble: boot.img + rootfs.img + EDL full image + verify"
+    name: "assemble: boot.img + verify + upload"
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    needs: build-armbian
-    if: needs.build-armbian.outputs.exit_code == '0'
+    timeout-minutes: 120
+    needs: [build-armbian]
+    if: needs.build-armbian.outputs.exit_code == '0' && github.event_name != 'pull_request'
 
     steps:
-      - name: Checkout our config
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install assemble deps
@@ -330,46 +281,45 @@ jobs:
               device-tree-compiler kpartx gdisk fdisk e2fsprogs \
               dosfstools mtools python3-pyelftools
 
-      - name: Download Armbian rootfs img from previous job
+      # --- 下载 build job 上传的产物 ---
+      - name: Download Armbian artifacts
         uses: actions/download-artifact@v4
         with:
-          # compile.sh 产物在 armbian-build/output/images/*.img.xz, 我们需要解压
+          name: armbian-build-output-${{ github.run_number }}
           path: armbian-output
-          pattern: "Armbian_*Ufi003*.img.xz"
-          merge-multiple: true
 
-      - name: Find and decompress Armbian img
+      # --- 解压 rootfs img ---
+      - name: Find and decompress rootfs img
+        id: decompress
         run: |
-          echo "=== Downloaded artifacts ==="
-          ls -la armbian-output/
+          echo "=== Downloaded ==="
+          find armbian-output -type f
 
-          XZ=$(find armbian-output -name "*.img.xz" -o -name "*.img" | head -1)
-          if [[ -z "$XZ" ]]; then
-              echo "❌ No rootfs img found"
+          XZ_OR_IMG=$(find armbian-output -type f \( -name "*.img.xz" -o -name "*.img" \) | head -1)
+          if [[ -z "$XZ_OR_IMG" ]]; then
+              echo "NO ROOTFS IMG FOUND in armbian-output/"
               exit 1
           fi
 
-          if [[ "$XZ" == *.xz ]]; then
-              echo "Decompressing..."
-              xz -k -d "$XZ"
-              ROOTFS="${XZ%.xz}"
+          if [[ "$XZ_OR_IMG" == *.xz ]]; then
+              xz -k -d "$XZ_OR_IMG"
+              ROOTFS="${XZ_OR_IMG%.xz}"
           else
-              ROOTFS="$XZ"
+              ROOTFS="$XZ_OR_IMG"
           fi
 
           echo "ROOTFS=${ROOTFS}" >> "$GITHUB_OUTPUT"
           stat "$ROOTFS"
 
-      # ---------------- 组装 boot.img ----------------
-      - name: Build boot.img (FAT32 + kernel + dtb + extlinux.conf)
+      # --- 组装 boot.img (FAT32 + kernel + dtb + extlinux.conf) ---
+      - name: Build boot.img
         run: |
-          ROOTFS="${{ steps.Find_and_decompress_Armbian_img.outputs.ROOTFS }}"
+          ROOTFS="${{ steps.decompress.outputs.ROOTFS }}"
 
           mkdir -p boot_staging
           dd if=/dev/zero of=boot.img bs=1M count=64 status=none
           mkfs.fat -F 32 -n UFI003_BOOT boot.img >/dev/null 2>&1
 
-          # 挂载 boot.img + rootfs.img
           BOOT_LOOP=$(sudo losetup -fP --show boot.img)
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS")
           BOOT_M=/mnt/ufi003-boot
@@ -378,60 +328,59 @@ jobs:
           sudo mount "$BOOT_LOOP" "$BOOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          # 复制 kernel / initrd
+          echo "=== rootfs /boot ==="
+          ls -la "$ROOT_M/boot/"
+
+          # kernel
           if find "$ROOT_M/boot" -maxdepth 1 -name "Image" | grep -q .; then
               sudo cp "$ROOT_M/boot/Image" "$BOOT_M/"
-          elif find "$ROOT_M/boot" -maxdepth 1 -name "vmlinuz*" | grep -q .; then
-              KERNEL=$(ls "$ROOT_M/boot"/vmlinuz-* | head -1)
-              sudo cp "$KERNEL" "$BOOT_M/Image"
           else
-              echo "❌ No kernel found in rootfs /boot"
-              ls -la "$ROOT_M/boot/"
-              exit 1
+              KERNEL=$(ls "$ROOT_M/boot"/vmlinuz-* 2>/dev/null | head -1)
+              if [[ -n "$KERNEL" ]]; then
+                  sudo cp "$KERNEL" "$BOOT_M/Image"
+              else
+                  echo "NO KERNEL in /boot!"; ls -la "$ROOT_M/boot/"; exit 1
+              fi
           fi
 
+          # initrd
           INITRD=$(find "$ROOT_M/boot" -maxdepth 1 -name "initrd*" | head -1)
-          if [[ -n "$INITRD" ]]; then
-              sudo cp "$INITRD" "$BOOT_M/initrd.img"
-          fi
+          [[ -n "$INITRD" ]] && sudo cp "$INITRD" "$BOOT_M/initrd.img" || true
 
-          # 复制 dtb
+          # dtb
           sudo mkdir -p "$BOOT_M/dtb/qcom"
           DTB=$(find "$ROOT_M" -path "*/dtb/qcom/*openstick*ufi003*.dtb" -o -path "*/dtb/qcom/msm8916*.dtb" 2>/dev/null | head -1)
           if [[ -n "$DTB" ]]; then
               sudo cp "$DTB" "$BOOT_M/dtb/qcom/"
-              echo "Using dtb: $DTB"
               DTB_NAME=$(basename "$DTB")
           else
-              echo "⚠️ No openstick dtb found, trying to dtc our .dts"
-              DTS="$(pwd)/msm8916-handsome-openstick-ufi003-armbian.dts"
-              if [[ -f "$DTS" ]]; then
-                  dtc -I dts -O dtb -o "$BOOT_M/dtb/qcom/msm8916-handsome-openstick-ufi003.dtb" "$DTS"
-                  DTB_NAME="msm8916-handsome-openstick-ufi003.dtb"
-              else
-                  echo "❌ No dtb found and no .dts to compile"
-                  exit 1
-              fi
+              echo "No dtb in rootfs, compiling from our .dts"
+              dtc -I dts -O dtb -o "$BOOT_M/dtb/qcom/msm8916-handsome-openstick-ufi003.dtb" \
+                  msm8916-handsome-openstick-ufi003-armbian.dts
+              DTB_NAME="msm8916-handsome-openstick-ufi003.dtb"
           fi
 
-          # 写 extlinux.conf
+          # 写 extlinux.conf — 用 printf 消灭 heredoc 缩进问题
           sudo mkdir -p "$BOOT_M/extlinux"
-          sudo tee "$BOOT_M/extlinux/extlinux.conf" >/dev/null << EXT
-# extlinux.conf — UFI003 OpenStick (no-modem Armbian)
-# lk2nd bootloader reads this directly
+          printf '%s\n' \
+              '# extlinux.conf — UFI003 OpenStick (no-modem Armbian)' \
+              '# lk2nd bootloader reads this directly' \
+              '' \
+              'label Armbian' \
+              '    kernel /Image' \
+              '    initrd /initrd.img' \
+              "    fdt /dtb/qcom/${DTB_NAME}" \
+              '    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw' \
+              '' \
+              'label Armbian (rescue)' \
+              '    kernel /Image' \
+              '    initrd /initrd.img' \
+              "    fdt /dtb/qcom/${DTB_NAME}" \
+              '    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw single' \
+              | sudo tee "$BOOT_M/extlinux/extlinux.conf" >/dev/null
 
-label Armbian
-    kernel /Image
-    initrd /initrd.img
-    fdt /dtb/qcom/${DTB_NAME}
-    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw
-
-label Armbian (rescue)
-    kernel /Image
-    initrd /initrd.img
-    fdt /dtb/qcom/${DTB_NAME}
-    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw single
-EXT
+          echo "=== extlinux.conf generated ==="
+          cat "$BOOT_M/extlinux/extlinux.conf"
 
           sudo sync
           sudo umount "$BOOT_M"
@@ -439,97 +388,67 @@ EXT
           sudo losetup -d "$BOOT_LOOP"
           sudo losetup -d "$ROOTFS_LOOP"
 
-          mkdir -p output/fastboot output/edl
+          mkdir -p output/fastboot
           cp boot.img output/fastboot/boot.img
           cp "$ROOTFS" output/fastboot/rootfs.img
-          cp "$ROOTFS" output/edl/rootfs.img
+          echo "boot.img: $(stat -c%s boot.img) bytes"
+          echo "rootfs.img: $(stat -c%s "$ROOTFS") bytes"
 
-          echo "✅ boot.img built: $(stat -c%s boot.img) bytes"
-
-      # ---------------- 组装完整 EDL 磁盘镜像 ----------------
-      - name: Build full EDL disk image (GPT + bootloader + boot + rootfs)
+      # --- 改 rootfs /etc/fstab ---
+      - name: Patch rootfs /etc/fstab
         run: |
-          ROOTFS="${{ steps.Find_and_decompress_Armbian_img.outputs.ROOTFS }}"
-          EDL_IMG="output/edl/ufi003-full.img"
-
-          # 默认 4GB eMMC (如果真机不是 4GB, 手动改 EMMC_SECTORS)
-          EMMC_SECTORS="${{ vars.EMMC_SECTORS || 8388608 }}"
-          # GitHub Actions 上 4GB 镜像太大 (artifact 单文件 2GB 限制!)
-          # 所以我们做小一点: 只包含 Qualcomm 固件分区 + boot + rootfs 起始部分
-          # 刷机用 fastboot flash 分区就行, EDL full img 只是补充
-          #
-          # 但 artifact 限制 2GB → 如果 rootfs 是 1GB, boot 是 64MB, 加起来 ~1.1GB < 2GB
-          # 完整 4GB EDL img 超出限制, 所以我们只做 fastboot 分卷产物
-          echo "Artifact limit 2GB/file — skipping full 4GB EDL image"
-          echo "Users with full EDL need can run sgdisk locally on flashed device"
-
-          # 写 rootfs 的 fstab (确保 PARTLABEL=rootfs)
+          ROOTFS="${{ steps.decompress.outputs.ROOTFS }}"
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS")
           ROOT_M=/mnt/ufi003-rootfs-edit
           sudo mkdir -p "$ROOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          sudo tee "$ROOT_M/etc/fstab" >/dev/null << FSTAB
-# UFI003 Armbian /etc/fstab (overridden by our build)
-PARTLABEL=rootfs / ext4 defaults,noatime,errors=remount-ro 0 1
-proc /proc proc defaults 0 0
-tmpfs /tmp tmpfs defaults,nosuid,nodev,size=512m 0 0
-devtmpfs /dev devtmpfs defaults,mode=0755,nosuid 0 0
-FSTAB
+          # 用 printf 消灭 heredoc
+          printf '%s\n' \
+              '# UFI003 Armbian /etc/fstab' \
+              'PARTLABEL=rootfs / ext4 defaults,noatime,errors=remount-ro 0 1' \
+              'proc /proc proc defaults 0 0' \
+              'tmpfs /tmp tmpfs defaults,nosuid,nodev,size=512m 0 0' \
+              'devtmpfs /dev devtmpfs defaults,mode=0755,nosuid 0 0' \
+              | sudo tee "$ROOT_M/etc/fstab" >/dev/null
+
+          echo "=== patched fstab ==="
+          cat "$ROOT_M/etc/fstab"
 
           sudo sync
           sudo umount "${ROOTFS_LOOP}p1" 2>/dev/null || sudo umount "$ROOT_M"
           sudo losetup -d "$ROOTFS_LOOP"
-          echo "✅ /etc/fstab patched with PARTLABEL=rootfs"
 
-      # ---------------- 静态自检 ----------------
+      # --- 静态自检 ---
       - name: Verify artifacts
         run: |
-          echo "=== 静态自检 ==="
-          PASS=0; FAIL=0; WARN=0
-
           BOOT_IMG="output/fastboot/boot.img"
           ROOTFS_IMG="output/fastboot/rootfs.img"
+          PASS=0; FAIL=0
 
-          check() { if eval "$2" 2>&1; then echo "  ✅ $1"; PASS=$((PASS+1)); else echo "  ❌ $1"; FAIL=$((FAIL+1)); fi; }
-          warn()  { echo "  ⚠️  $1"; WARN=$((WARN+1)); }
+          boop() { if eval "$1" 2>/dev/null; then echo "  OK: $2"; PASS=$((PASS+1)); else echo "  FAIL: $2"; FAIL=$((FAIL+1)); fi; }
 
-          check "boot.img exists (<=64MB)" "[ -f '$BOOT_IMG' ] && [ \$(stat -c%s '$BOOT_IMG') -le 67108864 ]"
-          check "rootfs.img exists"        "[ -f '$ROOTFS_IMG' ]"
-          check "boot.img is FAT"          "file '$BOOT_IMG' | grep -qi 'FAT'"
-          check "rootfs.img is ext4"       "file '$ROOTFS_IMG' | grep -qi 'ext4'"
+          boop "[ -f '$BOOT_IMG' ] && [ \$(stat -c%s '$BOOT_IMG') -le 67108864 ]" "boot.img <= 64MB"
+          boop "[ -f '$ROOTFS_IMG' ]" "rootfs.img exists"
+          boop "file '$BOOT_IMG' | grep -qi 'FAT'" "boot.img is FAT"
+          boop "file '$ROOTFS_IMG' | grep -qi 'ext4'" "rootfs.img is ext4"
 
           BOOT_LOOP=$(sudo losetup -fP --show "$BOOT_IMG")
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS_IMG")
-          BOOT_M=/mnt/verify-boot
-          ROOT_M=/mnt/verify-root
+          BOOT_M=/mnt/vb
+          ROOT_M=/mnt/vr
           sudo mkdir -p "$BOOT_M" "$ROOT_M"
           sudo mount "$BOOT_LOOP" "$BOOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          check "boot has kernel"       "[ -f '$BOOT_M/Image' ]"
-          check "boot has extlinux.conf" "[ -f '$BOOT_M/extlinux/extlinux.conf' ]"
-          check "boot has dtb"          "find '$BOOT_M' -name '*.dtb' | grep -q ."
-          check "extlinux has PARTLABEL" "grep -q 'PARTLABEL=rootfs' '$BOOT_M/extlinux/extlinux.conf'"
-          check "rootfs has systemd"    "[ -f '$ROOT_M/sbin/init' ]"
-          check "rootfs has /boot"      "[ -d '$ROOT_M/boot' ]"
-          check "rootfs fstab correct"  "grep -q 'PARTLABEL=rootfs' '$ROOT_M/etc/fstab'"
-
-          if find "$ROOT_M" -path "*/dtb/qcom/*openstick*ufi003*.dtb" | grep -q .; then
-              echo "  ✅ rootfs has openstick-specific dtb"
-              PASS=$((PASS+1))
-          elif find "$ROOT_M" -path "*/dtb/qcom/msm8916*.dtb" | grep -q .; then
-              warn "rootfs has generic msm8916 dtb (not openstick variant — 可能需要路线 B)"
-          else
-              warn "rootfs has no msm8916 dtb"
-          fi
-
-          if [[ -f "$ROOT_M/lib/firmware/qcom/wcnss.mdt" ]]; then
-              echo "  ✅ WiFi firmware present in rootfs"
-              PASS=$((PASS+1))
-          else
-              warn "WiFi firmware missing (must be installed manually after flash)"
-          fi
+          boop "[ -f '$BOOT_M/Image' ]" "boot has kernel"
+          boop "[ -f '$BOOT_M/extlinux/extlinux.conf' ]" "boot has extlinux.conf"
+          boop "find '$BOOT_M' -name '*.dtb' | grep -q ." "boot has dtb"
+          boop "grep -q 'PARTLABEL=rootfs' '$BOOT_M/extlinux/extlinux.conf'" "extlinux has PARTLABEL"
+          boop "grep -q 'console=ttyMSM0' '$BOOT_M/extlinux/extlinux.conf'" "extlinux has ttyMSM0"
+          boop "grep -q 'PARTLABEL=rootfs' '$ROOT_M/etc/fstab'" "rootfs fstab correct"
+          boop "[ -f '$ROOT_M/sbin/init' ]" "rootfs has systemd"
+          boop "[ -d '$ROOT_M/boot' ]" "rootfs has /boot"
 
           sudo umount "$BOOT_M"
           sudo umount "${ROOTFS_LOOP}p1" 2>/dev/null || sudo umount "$ROOT_M"
@@ -537,31 +456,24 @@ FSTAB
           sudo losetup -d "$ROOTFS_LOOP"
 
           echo ""
-          echo "══════════════════════════════════════════"
-          echo "  PASS=$PASS  FAIL=$FAIL  WARN=$WARN"
-          echo "══════════════════════════════════════════"
+          echo "PASS=$PASS FAIL=$FAIL"
+          [[ $FAIL -eq 0 ]] || exit 1
 
-          if [[ $FAIL -gt 0 ]]; then
-              echo "❌ FAIL checks found, artifact may be unusable"
-              exit 1
-          fi
-
-      # ---------------- 上传 artifact ----------------
-      - name: Package and upload artifacts
+      # --- 上传最终产物 ---
+      - name: Upload final artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "ufi003-armebian-${{ github.run_number }}"
+          name: "ufi003-armbian-${{ github.run_number }}"
           path: |
             output/fastboot/boot.img
             output/fastboot/rootfs.img
-            boot.img    # 临时产物也保留
           retention-days: 30
           if-no-files-found: error
 
-      - name: Upload source files (for reference)
+      - name: Upload source + flash tools
         uses: actions/upload-artifact@v4
         with:
-          name: "ufi003-config-source"
+          name: "ufi003-tools-${{ github.run_number }}"
           path: |
             config/
             userpatches/
@@ -570,5 +482,6 @@ FSTAB
             flash-edl.sh
             verify-image.sh
             FINAL_ANSWERS.md
+            ufi003-armbian-build-guide.md
           retention-days: 30
           if-no-files-found: warn
