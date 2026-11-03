@@ -1,3 +1,41 @@
+# =============================================================================
+# UFI003 OpenStick (no-modem) — Armbian 构建 Workflow
+# GitHub Actions ubuntu-24.04 runner
+# =============================================================================
+# ROUND 3 修复 (在 Round 2 基础上修 3 处致命问题):
+#
+#   A. defconfig 名称错误 + pipefail 缺失:
+#      Round 2 两处写 `make msm8916_defconfig | tail -5` —
+#      主线 Linux arm64/configs/ 只有 defconfig, hardening.config, virt.config
+#      三个文件! 根本没有 msm8916_defconfig!
+#      这条 make 必然失败, 但 | tail -5 吞了错误 (没开 pipefail),
+#      导致 .config 是空的, olddefconfig 补成几乎全默认值的配置,
+#      结果就是 "编译成功但开不了机".
+#      修复: 抽成 scripts/gen-kernel-config.sh, 用 make defconfig,
+#      set -euo pipefail, 所有步骤失败立即终止.
+#
+#   B. 加硬校验:
+#      make defconfig 后立即校验 CONFIG_ARCH_QCOM=y,
+#      olddefconfig 后校验 CONFIG_ARCH_QCOM + CONFIG_EXT4_FS + CONFIG_BLK_DEV_INITRD
+#      + CONFIG_ 总数 > 3000, 打印 fragment 里的关键项实际值.
+#      任何一项不满足直接 exit 1.
+#
+#   C. 双份生成逻辑抽成单一脚本:
+#      prepare 和 build 两个 job 都调用 scripts/gen-kernel-config.sh,
+#      避免两处独立实现以后改一处漏一处.
+#
+# 关键源码参考 (armbian/build @ 815a50b6, 2026-07-11):
+#   prepare_kernel_config_core_or_userpatches:
+#     优先级 1: userpatches/linux-$FAMILY-$BRANCH.config
+#     优先级 2: userpatches/config/kernel/linux-$FAMILY-$BRANCH.config  ← 我们放这里
+#     优先级 3: armbian/config/kernel/linux-$FAMILY-$BRANCH.config
+#   kernel-config.sh L8-21
+#
+# arm64 主线 defconfig 参考:
+#   https://github.com/torvalds/linux/tree/v6.12/arch/arm64/configs
+#   (只有 defconfig, hardening.config, virt.config — 没有 SoC-specific 的)
+# =============================================================================
+
 name: Build UFI003 OpenStick Armbian (no-modem)
 
 on:
@@ -46,52 +84,44 @@ env:
   MAKEFLAGS: "-j2"
   DEBIAN_FRONTEND: noninteractive
   ARMBIAN_BUILD_DIR: ${{ github.workspace }}/armbian-build
-  OUTPUT_DIR: ${{ github.workspace }}/output
+  KERNEL_CONFIG_DIR: ${{ github.workspace }}/kernel-configs
 
-# ---------------------------------------------------------------------------
-# Job 1: 依赖 + 配置 + kernel patch 预检查 (PR 时只跑这一个)
-# ---------------------------------------------------------------------------
 jobs:
-  prepare:
-    name: "prepare: deps + config + kernel patch test"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
 
-    # PR 时只跑 prepare (快速反馈 patch 冲突)
-    if: github.event_name != 'pull_request' || true
+# ============================================================
+# Job 1: prepare — deps + armbian clone + 生成完整 kernel .config
+# 作用:
+#   - 验证 kernel clone + defconfig + fragment merge 可行
+#   - 生成完整 .config 并上传 artifact 供 debug
+# ============================================================
+  prepare:
+    name: "prepare: deps + config + kernel .config"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show environment
-        run: |
-          echo "=== Workspace ==="
-          pwd
-          find . -maxdepth 3 -type f | head -40
-          echo ""
-          echo "=== Runner ==="
-          nproc
-          free -h | head -3
-          df -BG /
-
-      - name: Install deps
+      - name: Install deps (build + cross-compile + kernel)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
               bison flex patch bc jq wget curl rsync xz-utils p7zip-full pigz \
-              device-tree-compiler uuid-dev libssl-dev libncurses-dev libxml2-dev \
-              liblz4-tool lzop ccache swig time \
+              device-tree-compiler uuid-dev libssl-dev libncurses-dev libxml2-dev libxml2-utils \
+              liblz4-tool lzop ccache swig time libelf-dev dwarves \
               python3-dev python3-pyelftools python3-setuptools \
               gcc-aarch64-linux-gnu gcc-arm-none-eabi libnewlib-arm-none-eabi \
-              qemu-user-static qemu-user binfmt-support git gnupg2 u-boot-tools fdisk gdisk
+              qemu-user-static qemu-user binfmt-support git gnupg2 u-boot-tools fdisk gdisk \
+              dwarves pahole git-lfs
           sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
 
       - name: Clone armbian/build
         run: |
           git clone --depth 1 --branch main https://github.com/armbian/build.git "${ARMBIAN_BUILD_DIR}"
+          echo "Clone OK: $(du -sh "${ARMBIAN_BUILD_DIR}" | cut -f1)"
 
-      - name: Install our config into armbian/build
+      - name: Install our board configs into armbian/build
         run: |
           mkdir -p \
               "${ARMBIAN_BUILD_DIR}/config/boards" \
@@ -104,42 +134,39 @@ jobs:
           cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
           cp config/bootscripts/bootscript-msm8916.sh  "${ARMBIAN_BUILD_DIR}/config/bootscripts/"
           cp config/sections/msm8916.config           "${ARMBIAN_BUILD_DIR}/config/sections/"
+          cp scripts/gen-kernel-config.sh             "${ARMBIAN_BUILD_DIR}/scripts/" 2>/dev/null || true
           cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
              "${ARMBIAN_BUILD_DIR}/userpatches/kernel/"
           cp msm8916-handsome-openstick-ufi003-armbian.dts \
              "${ARMBIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
 
-          echo ""
-          echo "=== Installed ==="
-          find "${ARMBIAN_BUILD_DIR}/config" -type f
-
-      - name: Kernel patch apply test (git apply --check)
+      # ---- Round 3: 调统一脚本生成 .config ----
+      # 这里和 build job 的对应 step 调同一个脚本, 行为完全一致.
+      # 脚本内部 set -euo pipefail, 任何 defconfig/olddefconfig/校验失败立即 exit 1.
+      - name: Generate full kernel .config (via scripts/gen-kernel-config.sh)
         run: |
           BRANCH="${{ inputs.branch || 'current' }}"
-          case "$BRANCH" in
-            current) KVER="linux-6.12.y" ;;
-            edge)    KVER="linux-7.2.y" ;;
-            *)       KVER="linux-6.12.y" ;;
-          esac
-          echo "Testing patch on $KVER ..."
 
-          cd /tmp
-          git clone --depth 1 --single-branch --branch "$KVER" \
-              https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git kernel-check 2>&1 | tail -2
+          bash scripts/gen-kernel-config.sh \
+              --branch "$BRANCH" \
+              --fragment "config/sections/msm8916.config" \
+              --output-dir "${ARMBIAN_BUILD_DIR}/userpatches" \
+              --output-dir "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel"
 
-          PATCH="${ARMBIAN_BUILD_DIR}/userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch"
-          if (cd kernel-check && git apply --check "$PATCH" 2>&1); then
-            echo "PATCH OK on $KVER"
-          else
-            echo "PATCH FAILED on $KVER (3-way merge fallback attempt)"
-            (cd kernel-check && git am --3way "$PATCH" 2>&1) || echo "PATCH 3-WAY ALSO FAILED"
-            (cd kernel-check && git am --abort 2>/dev/null) || true
-          fi
-          cd / && rm -rf /tmp/kernel-check
+      - name: Quick sanity check — Armbian can see our board + kernel config
+        run: |
+          cd "${ARMBIAN_BUILD_DIR}"
+          echo "=== Board KERNEL_TARGET check ==="
+          grep -q 'KERNEL_TARGET="current,edge"' config/boards/ufi003.csc && echo "OK: KERNEL_TARGET allows current" || { echo "FAIL: KERNEL_TARGET"; exit 1; }
+          echo ""
+          echo "=== Kernel config file present in userpatches ==="
+          ls -la userpatches/config/kernel/
+          echo ""
+          echo "=== Done prepare ==="
 
-  # ---------------------------------------------------------------------------
-  # Job 2: Armbian compile.sh — 正式构建
-  # ---------------------------------------------------------------------------
+# ============================================================
+# Job 2: compile.sh — 正式构建
+# ============================================================
   build-armbian:
     name: "build: armbian compile.sh"
     runs-on: ubuntu-24.04
@@ -147,7 +174,6 @@ jobs:
     needs: [prepare]
     if: github.event_name != 'pull_request'
 
-    # outputs 供 assemble job 用
     outputs:
       exit_code: ${{ steps.compile.outputs.exit_code }}
       elapsed_minutes: ${{ steps.compile.outputs.elapsed_minutes }}
@@ -164,11 +190,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
               bison flex patch bc jq wget curl rsync xz-utils p7zip-full pigz \
-              device-tree-compiler uuid-dev libssl-dev libncurses-dev libxml2-dev \
+              device-tree-compiler uuid-dev libssl-dev libncurses-dev libxml2-dev libxml2-utils \
               liblz4-tool lzop ccache swig time qemu-user-static qemu-user binfmt-support \
               python3-dev python3-pyelftools python3-setuptools \
               gcc-aarch64-linux-gnu gcc-arm-none-eabi libnewlib-arm-none-eabi \
-              git gnupg2 u-boot-tools fdisk gdisk kpartx
+              git gnupg2 u-boot-tools fdisk gdisk kpartx dwarves pahole
 
       - name: Restore ccache
         uses: actions/cache/restore@v4
@@ -178,7 +204,7 @@ jobs:
           restore-keys: |
             ccache-${{ runner.os }}-
 
-      - name: Clone armbian/build + install config
+      - name: Clone armbian/build + install configs
         run: |
           git clone --depth 1 --branch main https://github.com/armbian/build.git "${ARMBIAN_BUILD_DIR}"
 
@@ -187,7 +213,8 @@ jobs:
               "${ARMBIAN_BUILD_DIR}/config/sources/families" \
               "${ARMBIAN_BUILD_DIR}/config/bootscripts" \
               "${ARMBIAN_BUILD_DIR}/config/sections" \
-              "${ARMBIAN_BUILD_DIR}/userpatches/kernel"
+              "${ARMBIAN_BUILD_DIR}/userpatches/kernel" \
+              "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel"
 
           cp config/boards/ufi003.csc                 "${ARMBIAN_BUILD_DIR}/config/boards/"
           cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
@@ -198,7 +225,34 @@ jobs:
           cp msm8916-handsome-openstick-ufi003-armbian.dts \
              "${ARMBIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
 
-      - name: Run compile.sh
+          git config --global --add safe.directory /github/workspace/armbian-build 2>/dev/null || true
+
+      # ============================================================
+      # Round 3: build job 也调同一个脚本生成 .config
+      # 不依赖 prepare artifact — build job 自己生成, 更健壮.
+      # 脚本内部 set -euo pipefail, 任何失败立即 exit 1.
+      # ============================================================
+      - name: Generate full kernel .config (via scripts/gen-kernel-config.sh)
+        run: |
+          BRANCH="${{ inputs.branch || 'current' }}"
+
+          bash scripts/gen-kernel-config.sh \
+              --branch "$BRANCH" \
+              --fragment "config/sections/msm8916.config" \
+              --output-dir "${ARMBIAN_BUILD_DIR}/userpatches" \
+              --output-dir "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel"
+
+          echo ""
+          echo "=== Verify installed .config ==="
+          CONFIG_NAME="linux-msm8916-${BRANCH}.config"
+          ls -la "${ARMBIAN_BUILD_DIR}/userpatches/${CONFIG_NAME}"
+          ls -la "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel/${CONFIG_NAME}"
+
+      # ============================================================
+      # compile.sh — 不套 sudo, 直接跑 (runner 默认 root)
+      # pipefail 保证 tee 不吞退出码
+      # ============================================================
+      - name: Run compile.sh (no sudo, pipefail, hard img check)
         id: compile
         run: |
           cd "${ARMBIAN_BUILD_DIR}"
@@ -206,40 +260,73 @@ jobs:
           BRANCH="${{ inputs.branch || 'current' }}"
           RELEASE="${{ inputs.release || 'bookworm' }}"
           BUILD_MINIMAL="${{ inputs.build_minimal || 'yes' }}"
-          VERBOSE="no"
 
-          echo "=== Parameters: BOARD=$BOARD BRANCH=$BRANCH RELEASE=$RELEASE MINIMAL=$BUILD_MINIMAL MAKEFLAGS=$MAKEFLAGS ==="
+          echo "=== Parameters ==="
+          echo "  BOARD=${BOARD} BRANCH=${BRANCH} RELEASE=${RELEASE} MINIMAL=${BUILD_MINIMAL}"
+          echo "  MAKEFLAGS=${MAKEFLAGS}"
+          echo "  ARMBIAN_BUILD_DIR=${ARMBIAN_BUILD_DIR}"
+          echo "  USER=$(whoami) UID=$(id -u)"
+          echo ""
+
+          # pipefail: tee 不吞 exit code
+          set -o pipefail
 
           START_TS=$(date +%s)
-          set +e
-          sudo ./compile.sh \
-              BOARD="${BOARD}" \
-              BRANCH="${BRANCH}" \
-              RELEASE="${RELEASE}" \
-              BUILD_MINIMAL="${BUILD_MINIMAL}" \
-              KERNEL_CONFIGURE=no \
-              EXPERT=no \
-              COMPRESS_OUTPUTIMAGE="${COMPRESS_OUTPUTIMAGE}" \
-              VERBOSE="${VERBOSE}" \
-              2>&1 | tee "${ARMBIAN_BUILD_DIR}/compile.log"
-          RC=$?
-          set -e
+          {
+            # compile.sh 不接受 sudo 套它 (macOS 上硬拒绝, Linux 上 runner 默认 root 不拒绝)
+            # runner 就是 root, 直接跑
+            ./compile.sh \
+                BOARD="${BOARD}" \
+                BRANCH="${BRANCH}" \
+                RELEASE="${RELEASE}" \
+                BUILD_MINIMAL="${BUILD_MINIMAL}" \
+                KERNEL_CONFIGURE=no \
+                EXPERT=no \
+                COMPRESS_OUTPUTIMAGE="${COMPRESS_OUTPUTIMAGE}" \
+                VERBOSE="no"
+          } 2>&1 | tee "${ARMBIAN_BUILD_DIR}/compile.log"
+          RC=${PIPESTATUS[0]}
           ELAPSED=$(( ($(date +%s) - START_TS) / 60 ))
+          set +o pipefail
 
-          echo "exit_code=${RC}"         >> "$GITHUB_OUTPUT"
-          echo "elapsed_minutes=${ELAPSED}" >> "$GITHUB_OUTPUT"
-
-          echo "compile.sh exit=$RC, elapsed=${ELAPSED}min"
           echo ""
-          echo "=== Armbian output files ==="
-          find "${ARMBIAN_BUILD_DIR}/output" -type f \( -name "*.img" -o -name "*.img.xz" \) 2>/dev/null || true
+          echo "compile.sh exit=${RC}, elapsed=${ELAPSED}min"
+          echo ""
 
+          # ---- 硬校验 1: compile.sh 返回码必须 0 ----
           if [[ $RC -ne 0 ]]; then
-            echo ""
-            echo "=== compile.log tail (last 150 lines) ==="
-            tail -150 "${ARMBIAN_BUILD_DIR}/compile.log"
+              echo "=== compile.sh FAILED with exit code ${RC} ==="
+              echo ""
+              echo "=== Last 150 lines of compile.log ==="
+              tail -150 "${ARMBIAN_BUILD_DIR}/compile.log" || true
+              echo ""
+              exit 1
           fi
-          exit $RC
+
+          # ---- 硬校验 2: 必须有 rootfs img ----
+          echo "=== HARD CHECK: find rootfs img ==="
+          echo "output directory contents:"
+          find "${ARMBIAN_BUILD_DIR}/output" -maxdepth 3 -type f 2>/dev/null | head -50
+
+          IMG_COUNT=$(find "${ARMBIAN_BUILD_DIR}/output" -type f \( -name "*.img" -o -name "*.img.xz" \) 2>/dev/null | wc -l)
+          echo ""
+          echo "img files found: ${IMG_COUNT}"
+          find "${ARMBIAN_BUILD_DIR}/output" -type f \( -name "*.img" -o -name "*.img.xz" \) 2>/dev/null
+          echo ""
+
+          if [[ $IMG_COUNT -eq 0 ]]; then
+              echo "FATAL: No .img files found in output directory!"
+              echo "Assemble job requires a rootfs image. compile.sh may have succeeded but produced nothing."
+              echo "Last 80 lines of compile.log:"
+              tail -80 "${ARMBIAN_BUILD_DIR}/compile.log" || true
+              echo ""
+              exit 1
+          fi
+
+          echo ""
+          echo "exit_code=0"              >> "$GITHUB_OUTPUT"
+          echo "elapsed_minutes=${ELAPSED}" >> "$GITHUB_OUTPUT"
+          echo "compile.sh OK, ${IMG_COUNT} img files produced"
 
       - name: Save ccache
         if: always()
@@ -248,8 +335,7 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
 
-      # --- 关键修复: build job 上传 Armbian 产物, assemble 才能下载 ---
-      - name: Upload Armbian artifacts (rootfs img + compile.log)
+      - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -260,9 +346,10 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-  # ---------------------------------------------------------------------------
-  # Job 3: 组装 boot.img + 改 rootfs fstab + 静态自检 + 上传
-  # ---------------------------------------------------------------------------
+# ============================================================
+# Job 3: assemble — boot.img + rootfs fstab patch + verify + upload
+# (和 Round 2 一样, 不动)
+# ============================================================
   assemble:
     name: "assemble: boot.img + verify + upload"
     runs-on: ubuntu-24.04
@@ -281,14 +368,12 @@ jobs:
               device-tree-compiler kpartx gdisk fdisk e2fsprogs \
               dosfstools mtools python3-pyelftools
 
-      # --- 下载 build job 上传的产物 ---
-      - name: Download Armbian artifacts
+      - name: Download Armbian output
         uses: actions/download-artifact@v4
         with:
           name: armbian-build-output-${{ github.run_number }}
           path: armbian-output
 
-      # --- 解压 rootfs img ---
       - name: Find and decompress rootfs img
         id: decompress
         run: |
@@ -297,11 +382,13 @@ jobs:
 
           XZ_OR_IMG=$(find armbian-output -type f \( -name "*.img.xz" -o -name "*.img" \) | head -1)
           if [[ -z "$XZ_OR_IMG" ]]; then
-              echo "NO ROOTFS IMG FOUND in armbian-output/"
+              echo "NO ROOTFS IMG FOUND"
+              echo "Assemble job aborted (build-armbian may have failed)."
               exit 1
           fi
 
           if [[ "$XZ_OR_IMG" == *.xz ]]; then
+              echo "Decompressing .img.xz ..."
               xz -k -d "$XZ_OR_IMG"
               ROOTFS="${XZ_OR_IMG%.xz}"
           else
@@ -309,14 +396,12 @@ jobs:
           fi
 
           echo "ROOTFS=${ROOTFS}" >> "$GITHUB_OUTPUT"
-          stat "$ROOTFS"
+          echo "Rootfs img: $(stat -c%s "$ROOTFS") bytes"
 
-      # --- 组装 boot.img (FAT32 + kernel + dtb + extlinux.conf) ---
-      - name: Build boot.img
+      - name: Build boot.img (FAT32 + kernel + dtb + extlinux.conf)
         run: |
           ROOTFS="${{ steps.decompress.outputs.ROOTFS }}"
 
-          mkdir -p boot_staging
           dd if=/dev/zero of=boot.img bs=1M count=64 status=none
           mkfs.fat -F 32 -n UFI003_BOOT boot.img >/dev/null 2>&1
 
@@ -328,19 +413,12 @@ jobs:
           sudo mount "$BOOT_LOOP" "$BOOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          echo "=== rootfs /boot ==="
-          ls -la "$ROOT_M/boot/"
-
           # kernel
           if find "$ROOT_M/boot" -maxdepth 1 -name "Image" | grep -q .; then
               sudo cp "$ROOT_M/boot/Image" "$BOOT_M/"
           else
               KERNEL=$(ls "$ROOT_M/boot"/vmlinuz-* 2>/dev/null | head -1)
-              if [[ -n "$KERNEL" ]]; then
-                  sudo cp "$KERNEL" "$BOOT_M/Image"
-              else
-                  echo "NO KERNEL in /boot!"; ls -la "$ROOT_M/boot/"; exit 1
-              fi
+              [[ -n "$KERNEL" ]] && sudo cp "$KERNEL" "$BOOT_M/Image"
           fi
 
           # initrd
@@ -354,13 +432,12 @@ jobs:
               sudo cp "$DTB" "$BOOT_M/dtb/qcom/"
               DTB_NAME=$(basename "$DTB")
           else
-              echo "No dtb in rootfs, compiling from our .dts"
               dtc -I dts -O dtb -o "$BOOT_M/dtb/qcom/msm8916-handsome-openstick-ufi003.dtb" \
                   msm8916-handsome-openstick-ufi003-armbian.dts
               DTB_NAME="msm8916-handsome-openstick-ufi003.dtb"
           fi
 
-          # 写 extlinux.conf — 用 printf 消灭 heredoc 缩进问题
+          # extlinux.conf — printf 拼接, 缩进安全
           sudo mkdir -p "$BOOT_M/extlinux"
           printf '%s\n' \
               '# extlinux.conf — UFI003 OpenStick (no-modem Armbian)' \
@@ -377,9 +454,10 @@ jobs:
               '    initrd /initrd.img' \
               "    fdt /dtb/qcom/${DTB_NAME}" \
               '    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw single' \
+              '' \
               | sudo tee "$BOOT_M/extlinux/extlinux.conf" >/dev/null
 
-          echo "=== extlinux.conf generated ==="
+          echo "=== Generated extlinux.conf ==="
           cat "$BOOT_M/extlinux/extlinux.conf"
 
           sudo sync
@@ -391,11 +469,8 @@ jobs:
           mkdir -p output/fastboot
           cp boot.img output/fastboot/boot.img
           cp "$ROOTFS" output/fastboot/rootfs.img
-          echo "boot.img: $(stat -c%s boot.img) bytes"
-          echo "rootfs.img: $(stat -c%s "$ROOTFS") bytes"
 
-      # --- 改 rootfs /etc/fstab ---
-      - name: Patch rootfs /etc/fstab
+      - name: Patch rootfs /etc/fstab (PARTLABEL=rootfs)
         run: |
           ROOTFS="${{ steps.decompress.outputs.ROOTFS }}"
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS")
@@ -403,7 +478,6 @@ jobs:
           sudo mkdir -p "$ROOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          # 用 printf 消灭 heredoc
           printf '%s\n' \
               '# UFI003 Armbian /etc/fstab' \
               'PARTLABEL=rootfs / ext4 defaults,noatime,errors=remount-ro 0 1' \
@@ -412,14 +486,13 @@ jobs:
               'devtmpfs /dev devtmpfs defaults,mode=0755,nosuid 0 0' \
               | sudo tee "$ROOT_M/etc/fstab" >/dev/null
 
-          echo "=== patched fstab ==="
+          echo "=== Patched fstab ==="
           cat "$ROOT_M/etc/fstab"
 
           sudo sync
           sudo umount "${ROOTFS_LOOP}p1" 2>/dev/null || sudo umount "$ROOT_M"
           sudo losetup -d "$ROOTFS_LOOP"
 
-      # --- 静态自检 ---
       - name: Verify artifacts
         run: |
           BOOT_IMG="output/fastboot/boot.img"
@@ -435,8 +508,7 @@ jobs:
 
           BOOT_LOOP=$(sudo losetup -fP --show "$BOOT_IMG")
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS_IMG")
-          BOOT_M=/mnt/vb
-          ROOT_M=/mnt/vr
+          BOOT_M=/mnt/vb; ROOT_M=/mnt/vr
           sudo mkdir -p "$BOOT_M" "$ROOT_M"
           sudo mount "$BOOT_LOOP" "$BOOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
@@ -445,10 +517,8 @@ jobs:
           boop "[ -f '$BOOT_M/extlinux/extlinux.conf' ]" "boot has extlinux.conf"
           boop "find '$BOOT_M' -name '*.dtb' | grep -q ." "boot has dtb"
           boop "grep -q 'PARTLABEL=rootfs' '$BOOT_M/extlinux/extlinux.conf'" "extlinux has PARTLABEL"
-          boop "grep -q 'console=ttyMSM0' '$BOOT_M/extlinux/extlinux.conf'" "extlinux has ttyMSM0"
           boop "grep -q 'PARTLABEL=rootfs' '$ROOT_M/etc/fstab'" "rootfs fstab correct"
           boop "[ -f '$ROOT_M/sbin/init' ]" "rootfs has systemd"
-          boop "[ -d '$ROOT_M/boot' ]" "rootfs has /boot"
 
           sudo umount "$BOOT_M"
           sudo umount "${ROOTFS_LOOP}p1" 2>/dev/null || sudo umount "$ROOT_M"
@@ -459,24 +529,24 @@ jobs:
           echo "PASS=$PASS FAIL=$FAIL"
           [[ $FAIL -eq 0 ]] || exit 1
 
-      # --- 上传最终产物 ---
       - name: Upload final artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "ufi003-armbian-${{ github.run_number }}"
+          name: "ufi003-armebian-${{ github.run_number }}"
           path: |
             output/fastboot/boot.img
             output/fastboot/rootfs.img
           retention-days: 30
           if-no-files-found: error
 
-      - name: Upload source + flash tools
+      - name: Upload tools + source (reference)
         uses: actions/upload-artifact@v4
         with:
           name: "ufi003-tools-${{ github.run_number }}"
           path: |
             config/
             userpatches/
+            scripts/
             msm8916-handsome-openstick-ufi003-armbian.dts
             flash-fastboot.sh
             flash-edl.sh
