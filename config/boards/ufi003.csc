@@ -47,7 +47,8 @@ declare -g BOARD_VENDOR="handsome"
 declare -g BOARD_MAINTAINER="community"
 declare -g INTRODUCED="2024"
 declare -g BOARDFAMILY="msm8916"
-declare -g KERNEL_TARGET="edge"
+declare -g KERNEL_TARGET="current,edge"
+declare -g KERNEL_TEST_TARGET="current"
 
 # DTB 名称 (由 add-openstick-dts-ufi003-nomodem.patch 加入主线内核)
 declare -g BOOT_FDT_FILE="qcom/msm8916-handsome-openstick-ufi003.dtb"
