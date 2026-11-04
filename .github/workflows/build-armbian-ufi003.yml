@@ -388,6 +388,61 @@ jobs:
           ls -la "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel/${CONFIG_NAME}"
 
       # ============================================================
+      # Round 6: 真凶不是磁盘 — 是 qemu-user + apt 的 ENOMEM
+      #
+      # armbian 的 chroot_sdcard() 在 x86_64 容器里 chroot 进 arm64 rootfs,
+      # 靠 binfmt/qemu-aarch64-static 执行 arm64 的 apt-get.
+      # qemu-user 启动时会预留大量虚拟地址空间, 默认 overcommit 策略
+      # (vm.overcommit_memory=0, heuristic) 会拒绝这种"远超物理内存"的 mmap,
+      # apt 的 getline() 因此拿到 ENOMEM(12), 报成
+      #   "Could not read from ... InRelease - getline (12: Cannot allocate memory)"
+      # 紧接着的 "provides only weak security information" 只是同一轮解析失败的伴生警告.
+      #
+      # 证据: 同一错误在 bare metal (16GB RAM + 16GB swap) 上同样复现;
+      #       每次失败的文件不固定 (论坛复现是 debian-backports, 我们是 configng),
+      #       与具体仓库内容无关; 本次直接 curl 该 InRelease 得到 HTTP 200 / 6225 字节 /
+      #       合法 "-----BEGIN PGP SIGNED MESSAGE-----" / 96 行, 文件是好的.
+      # => 不是磁盘 (实测 111GiB 空闲), 不是源损坏, 是运行环境的虚拟内存策略.
+      #
+      # 修复: 放开 overcommit, 让 qemu 的虚拟预留成功 (Armbian 论坛给出的做法).
+      # 该参数作用于宿主机内核, 容器内的 qemu 同样受益.
+      # ============================================================
+      - name: Host tuning for qemu-user (apt getline ENOMEM fix)
+        run: |
+          set +e
+          sudo sysctl -w vm.overcommit_memory=1
+          echo "vm.overcommit_memory=$(cat /proc/sys/vm/overcommit_memory)"
+          free -h || true
+
+      # ============================================================
+      # Round 6: apt 源 / lists 快照
+      # 注意作用域: image 里的 /var/lib/apt/lists 是 cp -pr 自"容器"的 lists
+      # (见 apt-install.sh 的 apt_lists_copy_from_host_to_image_and_update),
+      # 所以在 runner 宿主机上删源并不会影响容器 — 删源这条路无效.
+      # 这里先记录宿主机侧作对照, 并判断那个失败文件在本机是否存在/多大.
+      # ============================================================
+      - name: Dump apt sources and lists (diagnostics)
+        run: |
+          REPORT="${GITHUB_WORKSPACE}/apt-report.txt"
+          {
+            echo "=== HOST apt sources ==="
+            ls -la /etc/apt/sources.list.d/ 2>/dev/null || true
+            grep -rn "configng\|github.armbian.com" /etc/apt/ 2>/dev/null | head -20 || true
+            echo "=== HOST /var/lib/apt/lists ==="
+            du -sh /var/lib/apt/lists 2>/dev/null || true
+            ls -la /var/lib/apt/lists 2>/dev/null | head -30 || true
+            echo "=== suspect file on host ==="
+            F=/var/lib/apt/lists/github.armbian.com_configng_dists_stable_InRelease
+            if [ -f "$F" ]; then
+              ls -l "$F" || true
+              echo "size=$(stat -c %s "$F" 2>/dev/null) lines=$(wc -l < "$F" 2>/dev/null)"
+              head -c 200 "$F" | od -c | head -5 || true
+            else
+              echo "not present on host (exists only inside the build container)"
+            fi
+          } | tee "$REPORT"
+
+      # ============================================================
       # Round 5: 磁盘守门 — 编译前必须有 >= 12GiB 可用
       # armbian 自己的门槛是 10GiB (prepare-host.sh:347 硬编码), 但 10GiB 只够它启动,
       # 内核+rootfs+debootstrap 峰值约 8-11GiB, 所以这里留 2GiB 余量.
@@ -549,7 +604,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: disk-report-${{ github.run_number }}
-          path: ${{ github.workspace }}/disk-report.txt
+          path: |
+            ${{ github.workspace }}/disk-report.txt
+            ${{ github.workspace }}/apt-report.txt
           retention-days: 14
           if-no-files-found: ignore
 
