@@ -128,15 +128,23 @@ jobs:
               "${ARMBIAN_BUILD_DIR}/config/sources/families" \
               "${ARMBIAN_BUILD_DIR}/config/bootscripts" \
               "${ARMBIAN_BUILD_DIR}/config/sections" \
-              "${ARMBIAN_BUILD_DIR}/userpatches/kernel"
+              "${ARMBIAN_BUILD_DIR}/userpatches/kernel" \
+              "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12"
 
           cp config/boards/ufi003.csc                 "${ARMBIAN_BUILD_DIR}/config/boards/"
           cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
           cp config/bootscripts/bootscript-msm8916.sh  "${ARMBIAN_BUILD_DIR}/config/bootscripts/"
           cp config/sections/msm8916.config           "${ARMBIAN_BUILD_DIR}/config/sections/"
           cp scripts/gen-kernel-config.sh             "${ARMBIAN_BUILD_DIR}/scripts/" 2>/dev/null || true
+          # patch 放根目录 (无害, 不会被扫) + 真正生效的位置
           cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
              "${ARMBIAN_BUILD_DIR}/userpatches/kernel/"
+          # 关键: armbian 只扫 userpatches/kernel/<KERNELPATCHDIR>/,
+          # KERNELPATCHDIR=archive/msm8916-6.12 (日志: "KERNELPATCHDIR is unset; using 'archive/msm8916-6.12'")
+          cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
+             "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12/"
+          echo "=== kernel patches in archive/msm8916-6.12 ==="
+          ls -la "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12/"
           cp msm8916-handsome-openstick-ufi003-armbian.dts \
              "${ARMBIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
 
@@ -278,14 +286,22 @@ jobs:
               "${ARMBIAN_BUILD_DIR}/config/bootscripts" \
               "${ARMBIAN_BUILD_DIR}/config/sections" \
               "${ARMBIAN_BUILD_DIR}/userpatches/kernel" \
+              "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12" \
               "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel"
 
           cp config/boards/ufi003.csc                 "${ARMBIAN_BUILD_DIR}/config/boards/"
           cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
           cp config/bootscripts/bootscript-msm8916.sh  "${ARMBIAN_BUILD_DIR}/config/bootscripts/"
           cp config/sections/msm8916.config           "${ARMBIAN_BUILD_DIR}/config/sections/"
+          # patch 放根目录 (无害, 不会被扫) + 真正生效的位置
           cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
              "${ARMBIAN_BUILD_DIR}/userpatches/kernel/"
+          # 关键: armbian 只扫 userpatches/kernel/<KERNELPATCHDIR>/,
+          # KERNELPATCHDIR=archive/msm8916-6.12 (日志: "KERNELPATCHDIR is unset; using 'archive/msm8916-6.12'")
+          cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
+             "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12/"
+          echo "=== kernel patches in archive/msm8916-6.12 ==="
+          ls -la "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12/"
           cp msm8916-handsome-openstick-ufi003-armbian.dts \
              "${ARMBIAN_BUILD_DIR}/userpatches/" 2>/dev/null || true
 
