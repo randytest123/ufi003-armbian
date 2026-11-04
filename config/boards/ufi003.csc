@@ -56,18 +56,53 @@ declare -g BOOT_FDT_FILE="qcom/msm8916-handsome-openstick-ufi003.dtb"
 # 分区表: GPT (bin/gpt_both0.bin)
 declare -g IMAGE_PARTITION_TABLE="gpt"
 
-# bootscript.sh 生成 extlinux.conf (lk2nd bootloader 直接读)
-declare -g BOOTCONFIG="none"
-declare -g BOOTSIZE="512"
-declare -g BOOTFS_TYPE="none"
+# --------------------------------------------------------------------------
+# 分区布局 — 全部依据 armbian-next lib/functions/image/partitioning.sh 源码
+#
+#   L124  if [[ $BOOTSIZE != "0" && (-n $BOOTFS_TYPE || $BOOTPART_REQUIRED == yes) ]]; then
+#         → 只有这两个条件之一成立才建独立 /boot 分区 (bootpart)
+#   L126  local bootfs=${BOOTFS_TYPE:-ext4}
+#         → BOOTFS_TYPE 只有"未设置/空"时才回落到 ext4, 值为 "none" 不会回落
+#   L186  display_alert "Creating partitions" "${bootfs:+/boot: $bootfs }root: $ROOTFS_TYPE"
+#         → 日志里的 "/boot: none" 就是 bootfs="none" 的直接证据
+#   L433  run_host_command_logged "mkfs.${mkfs[$bootfs]}" ...
+#         → mkfs 数组只有 ext4/ext2/fat/f2fs/btrfs/nilfs2/xfs 这些键 (L66-73),
+#           没有 "none" 键 → 拼出字面量 "mkfs." → bash: mkfs.: command not found
+#
+# 上一轮就是这么挂的: BOOTFS_TYPE="none" 是非空字符串, L124 判真 → 建了 512MiB
+# boot 分区, 然后 L433 拼出 "mkfs." (Error 127, partitioning.sh:433).
+# 结论: BOOTFS_TYPE 只有"合法文件系统名"这一个合法域, 想表达"没有 /boot 分区"
+#       必须用 BOOTSIZE="0" + 完全不声明 BOOTFS_TYPE.
+#
+# 本板选择: 不建独立 /boot 分区, kernel/dtb/extlinux.conf 全部留在 rootfs 的 /boot:
+#   1. assemble 作业挂载的是 rootfs 分区 p1, 并在 $ROOT_M/boot 里找 Image / dtb / initrd;
+#      一旦多出 p1=FAT boot 分区, 这套查找全部错位, rootfs 里也再没有 kernel
+#   2. lk2nd 只认 FAT, 但那个 64MB FAT32 boot.img 是 assemble 自己造的, 与 armbian 无关
+declare -g BOOTCONFIG="none" # 无 U-Boot (lk2nd 是外部 bootloader)
+declare -g BOOTSIZE="0"      # 0 = 不建 boot 分区
+
+# extlinux.conf 由 armbian 原生生成 (lib/functions/rootfs/distro-agnostic.sh L225-245):
+#   /boot/extlinux/extlinux.conf → kernel /boot/Image / fdt /boot/dtb/<BOOT_FDT_FILE>
+# 路径前缀由 `if [[ -n $BOOTFS_TYPE ]]; then bootpart_prefix=/ else /boot/` 决定,
+# 所以"不设 BOOTFS_TYPE"正好得到 /boot/ 前缀, 与我们的布局一致.
+# 设了 SRC_EXTLINUX=yes 后 BOOTSCRIPT 会被 armbian 忽略 (armbian-bsp-cli-deb.sh L335),
+# 因此 family conf 里那条 BOOTSCRIPT 已删除 — armbian-next 对非 .template 的 bootscript
+# 只是 cp -pv 原样复制到 /boot/<dst>, 会把 shell 脚本当成 extlinux.conf, 本身就不成立.
+declare -g SRC_EXTLINUX="yes"
 
 # 实测 console: blsp1_uart2 → ttyMSM0 @ 0x78b0000
 declare -g SERIALCON="ttyMSM0:115200"
 declare -g DEFAULT_CONSOLE="serial"
 
 # 内核命令行 (从 boot.img header 实测提取, 1.2GHz 和 2.1GHz 版完全一致)
-# 我们用 PARTLABEL=rootfs 代替 PARTUUID (Armbian 新构建的 rootfs 分区 UUID 会变)
-declare -g KERNEL_CMDLINE="earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw"
+#
+# 变量名必须是 SRC_CMDLINE: armbian-next 源码里 KERNEL_CMDLINE 一次都没被引用
+# (旧框架变量, 已废弃). partitioning.sh L533 追加的是:
+#   append root=$rootfs $SRC_CMDLINE $MAIN_CMDLINE
+# MAIN_CMDLINE 来自 config/sources/common.conf L17, 已自带:
+#   rw no_console_suspend consoleblank=0 fsck.fix=yes fsck.repair=yes net.ifnames=0 ...
+# 所以这里只补 mainline 缺的项. root= 由 armbian 自己写 (UUID=..., 比 PARTUUID 稳).
+declare -g SRC_CMDLINE="earlycon console=ttyMSM0,115200 rootwait no_framebuffer=true"
 
 # 视频输出: 无 (DTB mdss disabled + boot cmdline no_framebuffer=true)
 declare -g HAS_VIDEO_OUTPUT="no"
