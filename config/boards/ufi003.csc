@@ -137,7 +137,14 @@ function post_family_tweaks_bsp__ufi003_usb_gadget() {
 		WantedBy=multi-user.target
 	UNIT
 
-	run_host_command_logged chroot "${SDCARD}" systemctl enable usb-gadget.service
+	# 不能切进 arm64 rootfs 执行 systemctl (bsp 容器无 binfmt/qemu → 127 command not found).
+	# 也不用 systemctl --root= (容器内 systemd 版本行为不稳, 跨架构 rootfs 边界情况多).
+	# systemctl enable 的磁盘等价物 = multi-user.target.wants/ 下指向 unit 的 symlink,
+	# 开机时 systemd 扫 wants 目录自动拉起 -> 纯文件操作, 不依赖任何客户机二进制.
+	mkdir -p "${SDCARD}/etc/systemd/system/multi-user.target.wants"
+	ln -sf /etc/systemd/system/usb-gadget.service \
+		"${SDCARD}/etc/systemd/system/multi-user.target.wants/usb-gadget.service"
+
 	display_alert "UFI003" "USB gadget enabled (host: 192.168.200.1)" "ok"
 }
 
@@ -145,6 +152,7 @@ function post_family_tweaks_bsp__ufi003_usb_gadget() {
 function post_family_tweaks_bsp__ufi003_wifi_firmware_readme() {
 	display_alert "UFI003" "Writing WiFi firmware README" "info"
 
+	mkdir -p "${SDCARD}/root"
 	cat > "${SDCARD}/root/WIFI_FIRMWARE_README.txt" <<- README
 		=========================================
 		UFI003 WiFi Firmware (WCN3620) Setup Guide
