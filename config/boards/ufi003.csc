@@ -192,15 +192,51 @@ function post_family_tweaks_bsp__ufi003_wifi_firmware_readme() {
 	display_alert "UFI003" "WiFi firmware README written to /root/" "ok"
 }
 
-# 基础网络配置 (第一次启动后 WiFi 固件到位才能用)
+# 基础网络配置 — systemd-networkd
+#
+# 依据 (run 41751868318 的 compile.log 实测, 不凭感觉):
+#   L467  change-tracking: after sourcing family config [ NETWORKING_STACK=systemd-networkd ]
+#   L476  Adding networking extensions [ net-systemd-networkd, net-systemd-timesyncd ]
+#   L487  Extension: net-systemd-networkd: Adding extra packages [ netplan.io ]
+#   L23699 镜像里有 /etc/NetworkManager/conf.d/ (NM 装了), 但 stack 明确是 systemd-networkd
+#   → bookworm minimal 这套构建的网络栈是 systemd-networkd (+ netplan.io), 不是 ifupdown.
+#   /etc/network/interfaces.d/ 目录根本不存在, 写它必然 "No such file or directory"
+#   (上一次构建就是这么挂的), 而且 minimal 里没有 ifupdown, 写了也没人读.
+#
+# 所以改写 systemd-networkd 的 .network 文件; mkdir -p 保证目录存在; 全程幂等.
+# 注意: usb0 (RNDIS gadget) 的 IP 由 /usr/local/bin/setup-usb-gadget.sh 用 ip addr 设置,
+#       这里不接管, 避免和 gadget 脚本冲突.
 function post_family_tweaks_bsp__ufi003_network_defaults() {
-	display_alert "UFI003" "Writing default network config" "info"
+	display_alert "UFI003" "Writing default network config (systemd-networkd)" "info"
 
-	cat > "${SDCARD}/etc/network/interfaces.d/wlan0" <<- WLAN
-		auto wlan0
-		iface wlan0 inet dhcp
-		    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
-	WLAN
+	# wlan0 — DHCP; WiFi firmware 需手动放进 /lib/firmware/qcom/ 后才会出现 wlan0
+	mkdir -p "${SDCARD}/etc/systemd/network"
+	cat > "${SDCARD}/etc/systemd/network/25-wlan0.network" <<- NET
+		[Match]
+		Name=wlan0
 
-	display_alert "UFI003" "Default wlan0 dhcp config added" "ok"
+		[Network]
+		DHCP=yes
+
+		[DHCPv4]
+		UseDNS=yes
+	NET
+
+	# wpa_supplicant 模板 — 用户填 SSID/PSK 后 systemctl enable --now wpa_supplicant@wlan0
+	mkdir -p "${SDCARD}/etc/wpa_supplicant"
+	cat > "${SDCARD}/etc/wpa_supplicant/wpa_supplicant-wlan0.conf" <<- WPA
+		# UFI003 — 填好 network={} 段后执行:
+		#   systemctl enable --now wpa_supplicant@wlan0
+		ctrl_interface=/run/wpa_supplicant
+		update_config=1
+		country=CN
+
+		# network={
+		#     ssid="你的WiFi"
+		#     psk="你的密码"
+		# }
+	WPA
+	chmod 600 "${SDCARD}/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"
+
+	display_alert "UFI003" "systemd-networkd: 25-wlan0.network + wpa_supplicant-wlan0.conf written" "ok"
 }
