@@ -80,7 +80,10 @@ env:
   BOARD: ufi003
   KERNEL_CONFIGURE: no
   EXPERT: no
-  COMPRESS_OUTPUTIMAGE: xz
+  # Round 5: 关掉 xz 压缩 — armbian 的 compress-checksum.sh 用子串匹配 (*xz* / *zst* / *sha*),
+  # 空值 = 不压缩不校验, 直接留下 .img 原文件, 省掉一份全尺寸临时文件 + xz 工作内存.
+  # assemble job 已支持 .img / .img.xz 两种输入 (L466 find 两种后缀).
+  COMPRESS_OUTPUTIMAGE: ""
   MAKEFLAGS: "-j2"
   DEBIAN_FRONTEND: noninteractive
   ARMBIAN_BUILD_DIR: ${{ github.workspace }}/armbian-build
@@ -177,7 +180,13 @@ jobs:
 # ============================================================
   build-armbian:
     name: "build: armbian compile.sh"
+    # ------------------------------------------------------------
+    # 兜底方案: 如果 14GB 标准 runner 的磁盘怎么腾都不够, 换 larger runner.
+    # GitHub "larger runners" 是付费的 (按分钟计费), 4-core 规格磁盘远大于 14GB.
+    # 启用方式: 注释掉下面这行 runs-on, 换成下一行 (需仓库已有 larger runner 权限)
+    # ------------------------------------------------------------
     runs-on: ubuntu-24.04
+    # runs-on: ubuntu-latest-4-cores
     timeout-minutes: 360
     needs: [prepare]
     if: github.event_name != 'pull_request'
@@ -268,13 +277,63 @@ jobs:
               gcc-aarch64-linux-gnu gcc-arm-none-eabi libnewlib-arm-none-eabi \
               git gnupg2 u-boot-tools fdisk gdisk kpartx dwarves pahole
 
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
-          restore-keys: |
-            ccache-${{ runner.os }}-
+      # ============================================================
+      # Round 5: ccache 关闭
+      # ccache 省的是时间, 占的是磁盘 (cache 目录 + actions/cache 压缩包两份).
+      # 14GB runner 上磁盘是瓶颈, 且首次全量编译命中率本来就低 -> 先关掉.
+      # 恢复办法: 去掉下面注释即可.
+      # - name: Restore ccache
+      #   uses: actions/cache/restore@v4
+      #   with:
+      #     path: ${{ env.CCACHE_DIR }}
+      #     key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
+      #     restore-keys: |
+      #       ccache-${{ runner.os }}-
+
+      # ============================================================
+      # Round 5: 若 /mnt 是独立且更大的盘, 把 armbian-build 整个搬过去
+      #
+      # 为什么用 symlink 而不是 bind mount:
+      #   armbian 自己在 docker 里跑, 容器只 bind mount 了 SRC 等少数路径.
+      #   docker 创建 bind mount 时会解析 host 侧 symlink 到真实路径,
+      #   容器内的挂载点仍是 /armbian, 与之前完全一致, 不需要改任何容器参数.
+      #   而 bind mount 方案要在 host 上额外 mount, 容器里的路径映射还得手动对齐,
+      #   反而更容易出错. 所以选 symlink.
+      #
+      # 如果 /mnt 与 / 是同一设备 (现代镜像有时会这样), 直接跳过并打印 "same disk".
+      # ============================================================
+      - name: Relocate heavy dirs to /mnt (only if separate and larger)
+        run: |
+          set -u
+          ROOT_DEV=$(df -P / | awk 'NR==2{print $1}')
+          ROOT_GIB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9'); ROOT_GIB=${ROOT_GIB:-0}
+          echo "[/]    device=${ROOT_DEV} free=${ROOT_GIB}GiB"
+
+          if [ ! -d /mnt ]; then
+            echo "[mnt] /mnt missing -> skip relocation"
+            exit 0
+          fi
+
+          MNT_DEV=$(df -P /mnt | awk 'NR==2{print $1}')
+          MNT_GIB=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9'); MNT_GIB=${MNT_GIB:-0}
+          echo "[/mnt] device=${MNT_DEV} free=${MNT_GIB}GiB"
+
+          if [ "$MNT_DEV" = "$ROOT_DEV" ]; then
+            echo "[mnt] same disk as / (${ROOT_DEV}) -> skip relocation"
+            exit 0
+          fi
+          if [ "$MNT_GIB" -le "$ROOT_GIB" ]; then
+            echo "[mnt] not larger than / -> skip relocation"
+            exit 0
+          fi
+
+          sudo mkdir -p /mnt/ufi003
+          sudo chown -R "$(id -u):$(id -g)" /mnt/ufi003
+          rm -rf "${ARMBIAN_BUILD_DIR}"
+          mkdir -p /mnt/ufi003/armbian-build
+          ln -s /mnt/ufi003/armbian-build "${ARMBIAN_BUILD_DIR}"
+          echo "[mnt] relocated: ${ARMBIAN_BUILD_DIR} -> $(readlink -f "${ARMBIAN_BUILD_DIR}")"
+          df -h /mnt || true
 
       - name: Clone armbian/build + install configs
         run: |
@@ -327,6 +386,42 @@ jobs:
           CONFIG_NAME="linux-msm8916-${BRANCH}.config"
           ls -la "${ARMBIAN_BUILD_DIR}/userpatches/${CONFIG_NAME}"
           ls -la "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel/${CONFIG_NAME}"
+
+      # ============================================================
+      # Round 5: 磁盘守门 — 编译前必须有 >= 12GiB 可用
+      # armbian 自己的门槛是 10GiB (prepare-host.sh:347 硬编码), 但 10GiB 只够它启动,
+      # 内核+rootfs+debootstrap 峰值约 8-11GiB, 所以这里留 2GiB 余量.
+      # 宁可 30 秒失败, 也不要等 60 分钟后死在 apt 里.
+      # ============================================================
+      - name: Disk gate before compile (>=12GiB) + snapshot
+        run: |
+          REPORT="${GITHUB_WORKSPACE}/disk-report.txt"
+          FREE_GIB=$(df -BG --output=avail "${ARMBIAN_BUILD_DIR}" 2>/dev/null | tail -1 | tr -dc '0-9')
+          FREE_GIB=${FREE_GIB:-0}
+
+          {
+            echo "=============================================="
+            echo "=== BEFORE compile  $(date -u +%FT%TZ) ==="
+            echo "=============================================="
+            df -h / || true
+            df -h "${ARMBIAN_BUILD_DIR}" || true
+            [ -d /mnt ] && df -h /mnt || true
+            echo "--- du key dirs (before) ---"
+            du -sh "${ARMBIAN_BUILD_DIR}/" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}/cache/sources" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}/cache" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}/output" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}/userpatches" 2>/dev/null || true
+            du -sh /var/lib/docker 2>/dev/null || true
+            echo "free=${FREE_GIB}GiB"
+          } | tee -a "$REPORT"
+
+          echo ""
+          echo "=== Disk gate: ${FREE_GIB}GiB free, need >= 12GiB ==="
+          if [ "${FREE_GIB}" -lt 12 ]; then
+            echo "::error ::runner disk too small for this build: only ${FREE_GIB}GiB free, need >=12GiB. Use a larger runner (see commented runs-on example) or a self-hosted runner."
+            exit 1
+          fi
 
       # ============================================================
       # compile.sh — 不套 sudo, 直接跑 (runner 默认 root)
@@ -411,12 +506,52 @@ jobs:
           echo "elapsed_minutes=${ELAPSED}" >> "$GITHUB_OUTPUT"
           echo "compile.sh OK, ${IMG_COUNT} img files produced"
 
-      - name: Save ccache
+      # Round 5: ccache save 关闭 (理由同上方 Restore ccache)
+      # - name: Save ccache
+      #   if: always()
+      #   uses: actions/cache/save@v4
+      #   with:
+      #     path: ${{ env.CCACHE_DIR }}
+      #     key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
+
+      # ============================================================
+      # Round 5: 编译后磁盘观测 (always) — 失败也执行
+      # 输出写进 disk-report.txt, 下一次用 always() 上传, 保证失败也能拿到
+      # ============================================================
+      - name: Collect disk diagnostics after compile (always)
         if: always()
-        uses: actions/cache/save@v4
+        run: |
+          REPORT="${GITHUB_WORKSPACE}/disk-report.txt"
+          {
+            echo ""
+            echo "=============================================="
+            echo "=== AFTER compile  $(date -u +%FT%TZ) ==="
+            echo "=============================================="
+            df -h / || true
+            df -h "${ARMBIAN_BUILD_DIR}" || true
+            [ -d /mnt ] && df -h /mnt || true
+            echo "--- du key dirs (after) ---"
+            du -sh "${ARMBIAN_BUILD_DIR}/cache/sources" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}/cache" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}/output" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}/userpatches" 2>/dev/null || true
+            du -sh /var/lib/docker 2>/dev/null || true
+            echo "--- output/images ---"
+            ls -la "${ARMBIAN_BUILD_DIR}/output/images" 2>/dev/null || true
+          } | tee -a "$REPORT" || true
+
+          echo ""
+          echo "--- full disk-report.txt ---"
+          cat "$REPORT" 2>/dev/null || true
+
+      - name: Upload disk diagnostics (always)
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
+          name: disk-report-${{ github.run_number }}
+          path: ${{ github.workspace }}/disk-report.txt
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Upload build artifacts
         if: always()
