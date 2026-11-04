@@ -75,8 +75,18 @@ declare -g HAS_VIDEO_OUTPUT="no"
 # modem firmware: 完全不需要
 declare -g BOARD_FIRMWARE_INSTALL="-none"
 
-# 必须装 WiFi 驱动 + USB gadget 工具
-declare -g PACKAGE_LIST_BOARD="wireless-tools iw hostapd wpa-supplicant usbutils"
+# 必须装 WiFi 用户态工具 + USB 工具
+#
+# 包名已逐个用 Debian ftp-master madison API 核对 (suite=bookworm, 2026-11):
+#   wireless-tools    30~pre9-14            ✅ arm64
+#   iw                5.19-1                ✅ arm64
+#   wpasupplicant     2:2.10-12+deb12u3     ✅ arm64   ← 注意无连字符!
+#   usbutils          1:014-1+deb12u1       ✅ arm64
+#   wireless-regdb    2026.05.30-1~deb12u1  ✅ all     ← 管制域数据库, iw/cfg80211 读它
+#   (wpa-supplicant 在 bookworm 不存在, apt 报 "Unable to locate package" — 已修正)
+#
+# 不加 hostapd: 它只用于 AP(开热点)模式; 我们只需要 STA 连路由器, wpasupplicant 足够.
+declare -g PACKAGE_LIST_BOARD="wireless-tools iw wpasupplicant usbutils wireless-regdb"
 declare -g PACKAGE_LIST_BOARD_REMOVE="avahi-daemon modemmanager ofono"
 
 # CPU 频率 (基线, 不用超频 opp 表——超频增加电压后可能不稳定)
