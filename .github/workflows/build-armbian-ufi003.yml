@@ -185,6 +185,70 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ============================================================
+      # Free up disk space  (Round 4)
+      #
+      # 依据: armbian/build lib/functions/host/prepare-host.sh
+      #   L340-349 check_host_has_enough_disk_space(): 检查 DEST 和 SRC/cache
+      #   L347   check_dir_has_enough_disk_space "${dir}" 10 || exit_if_countdown_not_aborted 10 ...
+      #   L353   declare -i min_free_space_gib="${2:-10}"
+      #   → 10GiB 是硬编码常量, 源码里没有任何 ARMBIAN_MIN_DISK_SPACE 之类的 override 变量.
+      #   非交互模式下直接 exit 43.
+      # 所以只能真腾磁盘, 不能 hack 阈值.
+      #
+      # ubuntu-24.04 runner 预装大量用不上的大件, 常见可回收:
+      #   /usr/share/dotnet (~2-4GB), /usr/local/lib/android (~8-12GB),
+      #   /opt/ghc (~1-2GB), /opt/hostedtoolcache/CodeQL (~3-5GB),
+      #   docker 残留镜像 (~2-4GB), apt 缓存 (~0.5-1GB)
+      #
+      # 注意:
+      #   - 所有清理命令都带 || true, 清理失败绝不把 job 搞挂
+      #   - 绝不碰 ${GITHUB_WORKSPACE}(/home/runner/work) 和 armbian-build 目录
+      #   - 放到 Install deps 之前: 先腾地方, 再装依赖/拉镜像, 空间最宽松
+      # ============================================================
+      - name: Free up disk space
+        run: |
+          echo "=== Disk BEFORE cleanup ==="
+          df -h / 2>/dev/null || true
+          echo ""
+
+          # GitHub 预装的无用组件
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /opt/microsoft || true
+          sudo rm -rf /usr/local/.ghcup || true
+
+          # apt 缓存 + 索引缓存 (后面 Install deps 会重新 apt-get update)
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          sudo rm -rf /var/cache/apt/archives/*.deb || true
+
+          # 上一次构建残留的 docker 镜像 (compile.sh 在 docker 容器里跑)
+          # -a 会清掉所有未被容器使用的镜像, 包括 armbian.local.only/armbian-build
+          sudo docker image prune -a -f || true
+          sudo docker builder prune -a -f || true
+
+          echo ""
+          echo "=== Disk AFTER cleanup ==="
+          df -h / 2>/dev/null || true
+          echo ""
+          echo "=== Disk of workspace (compile.sh 的 output 就在这个盘上) ==="
+          df -h "${GITHUB_WORKSPACE}" 2>/dev/null || true
+          echo ""
+          echo "=== 提醒: armbian 要求 output 所在磁盘 >= 10GiB 空闲 (硬编码, 不可覆盖) ==="
+
+          # 打印一个明确的数字, 方便直接看这次腾出了多少 / 还差多少
+          FREE_GIB=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
+          FREE_GIB="${FREE_GIB:-0}"
+          echo "=== Free space on / after cleanup: ${FREE_GIB} GiB (armbian 阈值: 10 GiB) ==="
+          if [[ "${FREE_GIB}" -lt 12 ]]; then
+            echo "::warning ::Only ${FREE_GIB}GiB free on / — 距 armbian 10GiB 阈值余量很小, 内核+rootfs 编译中途有 ENOSPC 风险"
+          fi
+
       - name: Install deps
         run: |
           sudo apt-get update -qq
@@ -273,8 +337,11 @@ jobs:
 
           START_TS=$(date +%s)
           {
-            # compile.sh 不接受 sudo 套它 (macOS 上硬拒绝, Linux 上 runner 默认 root 不拒绝)
-            # runner 就是 root, 直接跑
+            # 不套 sudo: GitHub runner 的默认用户是 runner (非 root), 有 passwordless sudo.
+            # compile.sh 检测到 EUID != 0 且 Docker 可用时, 会自己 relaunch 到 Docker 容器
+            # (utils-cli.sh L302-329: cli_standard_relaunch_docker_or_sudo, PREFER_DOCKER 默认 yes).
+            # 日志里的 "Docker run failed" 前缀 [🐳|...] 就是这个机制.
+            # 如果套 sudo 会走进 EUID==0 分支, 触发 "don't run ./compile.sh as root" 的告警路径.
             ./compile.sh \
                 BOARD="${BOARD}" \
                 BRANCH="${BRANCH}" \
