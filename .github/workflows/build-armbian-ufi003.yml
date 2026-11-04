@@ -702,7 +702,10 @@ jobs:
 
           # dtb
           sudo mkdir -p "$BOOT_M/dtb/qcom"
-          DTB=$(find "$ROOT_M" -path "*/dtb/qcom/*openstick*ufi003*.dtb" -o -path "*/dtb/qcom/msm8916*.dtb" 2>/dev/null | head -1)
+          # find -L: /boot/dtb 是 symlink → /boot/dtb-<ver> (kernel-debs.sh L457-459 的
+          # 非 vfat 分支), 不加 -L 时 find 不会进入该 symlink, 只会看到
+          # /boot/dtb-6.12.x/qcom/..., 不匹配 "*/dtb/qcom/*", DTB 就找不到了
+          DTB=$(find -L "$ROOT_M" -path "*/dtb/qcom/*openstick*ufi003*.dtb" -o -path "*/dtb/qcom/msm8916*.dtb" 2>/dev/null | head -1)
           if [[ -n "$DTB" ]]; then
               sudo cp "$DTB" "$BOOT_M/dtb/qcom/"
               DTB_NAME=$(basename "$DTB")
@@ -738,12 +741,21 @@ jobs:
           sudo sync
           sudo umount "$BOOT_M"
           sudo umount "${ROOTFS_LOOP}p1" 2>/dev/null || sudo umount "$ROOT_M"
-          sudo losetup -d "$BOOT_LOOP"
-          sudo losetup -d "$ROOTFS_LOOP"
 
           mkdir -p output/fastboot
+          # rootfs.img 必须是"裸 ext4 分区镜像", 不能是带 GPT 分区表的整盘 .img:
+          #   flash-fastboot.sh 用 `fastboot flash rootfs rootfs.img` 直接写进 lk2nd 的
+          #   rootfs 分区; 若把整盘镜像灌进去, 分区里的文件系统会整体偏移 (GPT 数据区
+          #   从 1MiB/2MiB 开始), 内核按 PARTLABEL=rootfs 挂载时找不到 ext4 超级块.
+          #   verify-image.sh L114 也是按 `file rootfs.img | grep ext4` 断言的.
+          P1_BYTES=$(sudo blockdev --getsize64 "${ROOTFS_LOOP}p1")
+          echo "rootfs partition: ${P1_BYTES} bytes"
+          sudo dd if="${ROOTFS_LOOP}p1" of=output/fastboot/rootfs.img bs=1M status=none
+          sudo chown "$(id -u):$(id -g)" output/fastboot/rootfs.img
           cp boot.img output/fastboot/boot.img
-          cp "$ROOTFS" output/fastboot/rootfs.img
+
+          sudo losetup -d "$BOOT_LOOP"
+          sudo losetup -d "$ROOTFS_LOOP"
 
       - name: Patch rootfs /etc/fstab (PARTLABEL=rootfs)
         run: |
@@ -779,10 +791,10 @@ jobs:
           boop "[ -f '$BOOT_IMG' ] && [ \$(stat -c%s '$BOOT_IMG') -le 67108864 ]" "boot.img <= 64MB"
           boop "[ -f '$ROOTFS_IMG' ]" "rootfs.img exists"
           boop "file '$BOOT_IMG' | grep -qi 'FAT'" "boot.img is FAT"
-          boop "file '$ROOTFS_IMG' | grep -qi 'ext4'" "rootfs.img is ext4"
 
           BOOT_LOOP=$(sudo losetup -fP --show "$BOOT_IMG")
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS_IMG")
+          boop "file '$ROOTFS_IMG' | grep -qi 'ext4'" "rootfs.img is ext4"
           BOOT_M=/mnt/vb; ROOT_M=/mnt/vr
           sudo mkdir -p "$BOOT_M" "$ROOT_M"
           sudo mount "$BOOT_LOOP" "$BOOT_M"
