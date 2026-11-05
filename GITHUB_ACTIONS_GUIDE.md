@@ -167,3 +167,45 @@ git push -u origin main
    - `No kernel found in rootfs /boot` → kernel patch 根本没生效，rootfs 里没有 Image
 
 3. 修复完 commit → push → 自动触发下一次 build
+
+---
+
+## Round 5: 磁盘策略（14GB runner 生存手册）
+
+**为什么判定是 ENOSPC 而不是内存不足**：apt 报
+`E: Could not read from /var/lib/apt/lists/github.armbian.com_configng_dists_stable_InRelease - getline (12: Cannot allocate memory)`。
+`getline()` 读文件失败返回 ENOMEM(12) 的典型场景是文件在被写入时被截断/无法扩展——即底层 `write()` 已经 ENOSPC。runner 有 15.6GiB RAM 而 apt 读的是个几百 KB 的 InRelease，内存不足不可能。所以是磁盘写满。
+
+**workflow 里的四道措施**：
+
+| 措施 | 预期省/多出 | 说明 |
+|---|---|---|
+| Free up disk space (Round 4) | +6~12GB | 删 dotnet/android/ghc/CodeQL/boost/swift、apt 缓存、docker 残留 |
+| Relocate to /mnt (Round 5) | 视 runner 而定 | 仅当 `/mnt` 是独立且更大的盘时，把 `armbian-build` 用 symlink 迁过去；同一块盘会打印 "same disk, skip" |
+| 关 ccache restore/save | +1~3GB | 时间换磁盘，首次编译命中率本来低 |
+| `COMPRESS_OUTPUTIMAGE=""` | +1~2GB | 不再生成 xz 临时文件；`compress-checksum.sh` 用子串匹配，空值即不压缩 |
+| Disk gate (>=12GiB) | 提前失败 | 编译前检查，不够直接报 "runner disk too small" |
+
+**诊断数据在哪**：build job 的 artifact `disk-report-<run#>`，`if: always()` 上传，**失败也能下载**。
+里面含编译前后的 `df -h /`、`df -h /mnt`、以及 `cache/sources`、`cache`、`output`、`userpatches`、`/var/lib/docker` 的 `du -sh`。
+
+**兜底：larger runner（付费）**。GitHub 的 larger runner（如 `ubuntu-latest-4-cores`）磁盘远大于标准 runner 的 14GB，按分钟计费，需要仓库/组织已开通。workflow 里 `build-armbian` job 的 `runs-on` 上方留了注释示例，取消注释即可切换。
+
+---
+
+## Round 6（更正 Round 5）：不是 ENOSPC，是 qemu-user + apt 的虚拟内存问题
+
+实测 `disk-report.txt`：runner 是 **145GB 盘**，编译前 111GiB 空闲、编译后 91GiB，`/mnt` 与 `/` 同一设备（`/dev/root`）。所以 Round 5 的 ENOSPC 判断**被推翻**；磁盘相关改动保留（无害），但不是本问题的解。
+
+**真正原因**：armbian 的 `chroot_sdcard()` 在 x86_64 容器里 chroot 进 arm64 rootfs，靠 `qemu-aarch64-static` 执行 arm64 的 `apt-get`。qemu-user 会预留海量虚拟地址空间，默认的 overcommit 策略（`vm.overcommit_memory=0`）拒绝这种 mmap，于是 apt 的 `getline()` 拿到 `ENOMEM(12)`，报成 `Could not read from ... InRelease - getline (12: Cannot allocate memory)`。后面的 "provides only weak security information" 只是同一轮解析失败后的伴生警告。
+
+判定依据：
+1. 直接 curl 那个 InRelease：HTTP 200、`Content-Length: 6225`、正文以 `-----BEGIN PGP SIGNED MESSAGE-----` 开头、96 行、最长行 101 字节 —— 文件是好的（不是 HTML 错误页/空文件/超大文件）。
+2. 同一个错误在 Armbian 论坛有复现，且失败文件是 `debian-backports` 的 InRelease，说明**与具体仓库无关**；连 bare metal（16GB RAM + 16GB swap）也会中招。
+3. 该错误是 sporadic（同一配置有时成功），符合"资源预留竞争"而不是确定性数据损坏。
+
+**修复**：编译前 `sudo sysctl -w vm.overcommit_memory=1`（workflow step `Host tuning for qemu-user`）。作用在宿主内核，容器里的 qemu 同样受益。
+
+**关于 configng 源**：`https://github.armbian.com/configng` 是 armbian-config 的软件源（官方文档里的 `armbian-config.sources`），由 armbian 构建容器镜像自带。`apt-install.sh` 的 `apt_lists_copy_from_host_to_image_and_update()` 用 `cp -pr` 把容器侧 `/var/lib/apt/lists` 复制进 image，再 chroot 跑 `apt-get update`。**在 runner 宿主机上删源无效**（容器有独立的 `/var/lib/apt/lists`），所以没有采用"删源"方案。
+
+**诊断**：新增 `Dump apt sources and lists` 步骤，把宿主侧 sources / lists 清单、那个 InRelease 的大小与 od 前 200 字节写进 `apt-report.txt`，与 `disk-report.txt` 一起放进 artifact `disk-report-<run#>`（`if: always()`，失败也能下载）。
