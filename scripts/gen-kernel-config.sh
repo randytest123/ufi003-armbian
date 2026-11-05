@@ -67,6 +67,17 @@ esac
 CONFIG_NAME="linux-msm8916-${BRANCH}.config"
 WORK_DIR="$(mktemp -d /tmp/ufi003-kernel-config-XXXXXX)"
 
+# Round 7: 宿主架构自适应.
+#   ubuntu-24.04-arm (arm64) 上, HOSTARCH == ARCH == arm64, armbian 参考实现
+#   (lib/functions/host/host-release.sh L15-16: amd64|arm64 都是 officially supported)
+#   直接用原生 gcc, 不需要交叉工具链 — 也就没必要装 gcc-aarch64-linux-gnu.
+#   x86_64 宿主仍按原样交叉编译.
+CROSS=""
+if [[ "$(uname -m)" != "aarch64" ]]; then
+  CROSS="CROSS_COMPILE=aarch64-linux-gnu-"
+fi
+echo "  HOST_ARCH=$(uname -m)  CROSS=${CROSS:-native}"
+
 echo "============================================================"
 echo " gen-kernel-config.sh"
 echo "   BRANCH=$BRANCH  KVER=$KVER  CONFIG_NAME=$CONFIG_NAME"
@@ -95,7 +106,7 @@ echo ""
 # Step 2: make arm64 通用 defconfig (不是 msm8916_defconfig —— arm64 树里没有!)
 # =========================================================================
 echo "=== Step 2/5: make ARCH=arm64 defconfig ==="
-if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig > /tmp/make_defconfig.log 2>&1; then
+if ! make ARCH=arm64 ${CROSS} defconfig > /tmp/make_defconfig.log 2>&1; then
   echo "FATAL: make defconfig FAILED!"
   echo "--- log (last 40 lines) ---"
   tail -40 /tmp/make_defconfig.log
@@ -152,7 +163,7 @@ else
 fi
 
 echo "  Running make olddefconfig ..."
-if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig > /tmp/make_olddefconfig.log 2>&1; then
+if ! make ARCH=arm64 ${CROSS} olddefconfig > /tmp/make_olddefconfig.log 2>&1; then
   echo "FATAL: make olddefconfig FAILED!"
   echo "--- log (last 40 lines) ---"
   tail -40 /tmp/make_olddefconfig.log
