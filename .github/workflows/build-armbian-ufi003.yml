@@ -99,25 +99,30 @@ jobs:
 # ============================================================
   prepare:
     name: "prepare: deps + config + kernel .config"
-    runs-on: ubuntu-24.04
+    # Round 7: 改用 arm64 原生 runner (公开仓库免费, ubuntu-24.04-arm)。
+    # 依据 armbian/build lib/functions/host/host-release.sh L15-16:
+    #   case "${HOSTARCH}" in amd64 | arm64) ;;   # officially supported
+    # 在 aarch64 宿主上 chroot 进 arm64 rootfs 是原生的, 不需要 qemu-user-static,
+    # 内核也按 HOSTARCH==ARCH 走原生工具链 (不再需要 CROSS_COMPILE)。
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install deps (build + cross-compile + kernel)
+      - name: Install deps (native arm64 toolchain)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
+              build-essential \
               bison flex patch bc jq wget curl rsync xz-utils p7zip-full pigz \
               device-tree-compiler uuid-dev libssl-dev libncurses-dev libxml2-dev libxml2-utils \
               liblz4-tool lzop ccache swig time libelf-dev dwarves \
               python3-dev python3-pyelftools python3-setuptools \
-              gcc-aarch64-linux-gnu gcc-arm-none-eabi libnewlib-arm-none-eabi \
-              qemu-user-static qemu-user binfmt-support git gnupg2 u-boot-tools fdisk gdisk \
-              dwarves pahole git-lfs
-          sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
+              git gnupg2 u-boot-tools fdisk gdisk pahole git-lfs
+          # Round 7: 不再安装 qemu-user-static / binfmt-support / gcc-aarch64-linux-gnu
+          # (arm64 宿主 = 目标架构, 原生执行, 无需二进制翻译和交叉编译)
 
       - name: Clone armbian/build
         run: |
@@ -180,13 +185,15 @@ jobs:
 # ============================================================
   build-armbian:
     name: "build: armbian compile.sh"
-    # ------------------------------------------------------------
-    # 兜底方案: 如果 14GB 标准 runner 的磁盘怎么腾都不够, 换 larger runner.
-    # GitHub "larger runners" 是付费的 (按分钟计费), 4-core 规格磁盘远大于 14GB.
-    # 启用方式: 注释掉下面这行 runs-on, 换成下一行 (需仓库已有 larger runner 权限)
-    # ------------------------------------------------------------
-    runs-on: ubuntu-24.04
-    # runs-on: ubuntu-latest-4-cores
+    # Round 7: arm64 原生 runner (公开仓库免费)。
+    # 宿主架构 = 目标架构 → 容器内 chroot 进 arm64 rootfs 不需要 qemu-user-static,
+    # "getline (12: Cannot allocate memory)" 这一整类 qemu-user ENOMEM 从根上消失。
+    # 已核验: armbian 的多架构构建镜像 ghcr.io/armbian/docker-armbian-build:
+    #   armbian-debian-trixie-latest 是 manifest list, 含 linux/amd64, linux/arm64,
+    #   linux/riscv64 → arm64 runner 上 pull 到的是原生 arm64 层, 连 docker 层都没有模拟。
+    # 标准 runner 规格: 4 vCPU / 16 GiB RAM, 磁盘与 x64 标准 runner 同规格
+    #   (本项目在 x64 上实测 df / = 145G, 110 GiB 空闲)。
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     needs: [prepare]
     if: github.event_name != 'pull_request'
@@ -202,138 +209,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ============================================================
-      # Free up disk space  (Round 4)
-      #
-      # 依据: armbian/build lib/functions/host/prepare-host.sh
-      #   L340-349 check_host_has_enough_disk_space(): 检查 DEST 和 SRC/cache
-      #   L347   check_dir_has_enough_disk_space "${dir}" 10 || exit_if_countdown_not_aborted 10 ...
-      #   L353   declare -i min_free_space_gib="${2:-10}"
-      #   → 10GiB 是硬编码常量, 源码里没有任何 ARMBIAN_MIN_DISK_SPACE 之类的 override 变量.
-      #   非交互模式下直接 exit 43.
-      # 所以只能真腾磁盘, 不能 hack 阈值.
-      #
-      # ubuntu-24.04 runner 预装大量用不上的大件, 常见可回收:
-      #   /usr/share/dotnet (~2-4GB), /usr/local/lib/android (~8-12GB),
-      #   /opt/ghc (~1-2GB), /opt/hostedtoolcache/CodeQL (~3-5GB),
-      #   docker 残留镜像 (~2-4GB), apt 缓存 (~0.5-1GB)
-      #
-      # 注意:
-      #   - 所有清理命令都带 || true, 清理失败绝不把 job 搞挂
-      #   - 绝不碰 ${GITHUB_WORKSPACE}(/home/runner/work) 和 armbian-build 目录
-      #   - 放到 Install deps 之前: 先腾地方, 再装依赖/拉镜像, 空间最宽松
-      # ============================================================
-      - name: Free up disk space
-        run: |
-          echo "=== Disk BEFORE cleanup ==="
-          df -h / 2>/dev/null || true
-          echo ""
+      # Round 7: 删掉了 "Free up disk space" / "Relocate heavy dirs to /mnt" / 12GiB gate.
+      # 原因: 实测这台标准 runner 是 145G 盘 (编译前后 110→91 GiB 空闲), 磁盘从来不是瓶颈;
+      # 而且 armbian 自己在 prepare-host.sh L340-353 有 10GiB 硬阈值的 fail-fast 检查,
+      # 真不够会立刻 exit 43, 不需要我们再守一道门。
 
-          # GitHub 预装的无用组件
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf /usr/share/swift || true
-          sudo rm -rf /opt/microsoft || true
-          sudo rm -rf /usr/local/.ghcup || true
-
-          # apt 缓存 + 索引缓存 (后面 Install deps 会重新 apt-get update)
-          sudo apt-get clean || true
-          sudo rm -rf /var/lib/apt/lists/* || true
-          sudo rm -rf /var/cache/apt/archives/*.deb || true
-
-          # 上一次构建残留的 docker 镜像 (compile.sh 在 docker 容器里跑)
-          # -a 会清掉所有未被容器使用的镜像, 包括 armbian.local.only/armbian-build
-          sudo docker image prune -a -f || true
-          sudo docker builder prune -a -f || true
-
-          echo ""
-          echo "=== Disk AFTER cleanup ==="
-          df -h / 2>/dev/null || true
-          echo ""
-          echo "=== Disk of workspace (compile.sh 的 output 就在这个盘上) ==="
-          df -h "${GITHUB_WORKSPACE}" 2>/dev/null || true
-          echo ""
-          echo "=== 提醒: armbian 要求 output 所在磁盘 >= 10GiB 空闲 (硬编码, 不可覆盖) ==="
-
-          # 打印一个明确的数字, 方便直接看这次腾出了多少 / 还差多少
-          FREE_GIB=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
-          FREE_GIB="${FREE_GIB:-0}"
-          echo "=== Free space on / after cleanup: ${FREE_GIB} GiB (armbian 阈值: 10 GiB) ==="
-          if [[ "${FREE_GIB}" -lt 12 ]]; then
-            echo "::warning ::Only ${FREE_GIB}GiB free on / — 距 armbian 10GiB 阈值余量很小, 内核+rootfs 编译中途有 ENOSPC 风险"
-          fi
-
-      - name: Install deps
+      - name: Install deps (native arm64 toolchain)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
               bison flex patch bc jq wget curl rsync xz-utils p7zip-full pigz \
               device-tree-compiler uuid-dev libssl-dev libncurses-dev libxml2-dev libxml2-utils \
-              liblz4-tool lzop ccache swig time qemu-user-static qemu-user binfmt-support \
+              liblz4-tool lzop ccache swig time \
               python3-dev python3-pyelftools python3-setuptools \
-              gcc-aarch64-linux-gnu gcc-arm-none-eabi libnewlib-arm-none-eabi \
               git gnupg2 u-boot-tools fdisk gdisk kpartx dwarves pahole
 
-      # ============================================================
-      # Round 5: ccache 关闭
-      # ccache 省的是时间, 占的是磁盘 (cache 目录 + actions/cache 压缩包两份).
-      # 14GB runner 上磁盘是瓶颈, 且首次全量编译命中率本来就低 -> 先关掉.
-      # 恢复办法: 去掉下面注释即可.
-      # - name: Restore ccache
-      #   uses: actions/cache/restore@v4
-      #   with:
-      #     path: ${{ env.CCACHE_DIR }}
-      #     key: ccache-${{ runner.os }}-${{ hashFiles('**/kernel/*.patch', 'config/sections/*.config') }}
-      #     restore-keys: |
-      #       ccache-${{ runner.os }}-
-
-      # ============================================================
-      # Round 5: 若 /mnt 是独立且更大的盘, 把 armbian-build 整个搬过去
-      #
-      # 为什么用 symlink 而不是 bind mount:
-      #   armbian 自己在 docker 里跑, 容器只 bind mount 了 SRC 等少数路径.
-      #   docker 创建 bind mount 时会解析 host 侧 symlink 到真实路径,
-      #   容器内的挂载点仍是 /armbian, 与之前完全一致, 不需要改任何容器参数.
-      #   而 bind mount 方案要在 host 上额外 mount, 容器里的路径映射还得手动对齐,
-      #   反而更容易出错. 所以选 symlink.
-      #
-      # 如果 /mnt 与 / 是同一设备 (现代镜像有时会这样), 直接跳过并打印 "same disk".
-      # ============================================================
-      - name: Relocate heavy dirs to /mnt (only if separate and larger)
-        run: |
-          set -u
-          ROOT_DEV=$(df -P / | awk 'NR==2{print $1}')
-          ROOT_GIB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9'); ROOT_GIB=${ROOT_GIB:-0}
-          echo "[/]    device=${ROOT_DEV} free=${ROOT_GIB}GiB"
-
-          if [ ! -d /mnt ]; then
-            echo "[mnt] /mnt missing -> skip relocation"
-            exit 0
-          fi
-
-          MNT_DEV=$(df -P /mnt | awk 'NR==2{print $1}')
-          MNT_GIB=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9'); MNT_GIB=${MNT_GIB:-0}
-          echo "[/mnt] device=${MNT_DEV} free=${MNT_GIB}GiB"
-
-          if [ "$MNT_DEV" = "$ROOT_DEV" ]; then
-            echo "[mnt] same disk as / (${ROOT_DEV}) -> skip relocation"
-            exit 0
-          fi
-          if [ "$MNT_GIB" -le "$ROOT_GIB" ]; then
-            echo "[mnt] not larger than / -> skip relocation"
-            exit 0
-          fi
-
-          sudo mkdir -p /mnt/ufi003
-          sudo chown -R "$(id -u):$(id -g)" /mnt/ufi003
-          rm -rf "${ARMBIAN_BUILD_DIR}"
-          mkdir -p /mnt/ufi003/armbian-build
-          ln -s /mnt/ufi003/armbian-build "${ARMBIAN_BUILD_DIR}"
-          echo "[mnt] relocated: ${ARMBIAN_BUILD_DIR} -> $(readlink -f "${ARMBIAN_BUILD_DIR}")"
-          df -h /mnt || true
+      # ccache 保持关闭: 首次全量编译命中率低, 缓存包反而占空间/时间。
 
       - name: Clone armbian/build + install configs
         run: |
@@ -388,95 +279,32 @@ jobs:
           ls -la "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel/${CONFIG_NAME}"
 
       # ============================================================
-      # Round 6: 真凶不是磁盘 — 是 qemu-user + apt 的 ENOMEM
+      # Round 7: 这里原来的 "Host tuning for qemu-user (overcommit)" 已删除。
       #
-      # armbian 的 chroot_sdcard() 在 x86_64 容器里 chroot 进 arm64 rootfs,
-      # 靠 binfmt/qemu-aarch64-static 执行 arm64 的 apt-get.
-      # qemu-user 启动时会预留大量虚拟地址空间, 默认 overcommit 策略
-      # (vm.overcommit_memory=0, heuristic) 会拒绝这种"远超物理内存"的 mmap,
-      # apt 的 getline() 因此拿到 ENOMEM(12), 报成
-      #   "Could not read from ... InRelease - getline (12: Cannot allocate memory)"
-      # 紧接着的 "provides only weak security information" 只是同一轮解析失败的伴生警告.
-      #
-      # 证据: 同一错误在 bare metal (16GB RAM + 16GB swap) 上同样复现;
-      #       每次失败的文件不固定 (论坛复现是 debian-backports, 我们是 configng),
-      #       与具体仓库内容无关; 本次直接 curl 该 InRelease 得到 HTTP 200 / 6225 字节 /
-      #       合法 "-----BEGIN PGP SIGNED MESSAGE-----" / 96 行, 文件是好的.
-      # => 不是磁盘 (实测 111GiB 空闲), 不是源损坏, 是运行环境的虚拟内存策略.
-      #
-      # 修复: 放开 overcommit, 让 qemu 的虚拟预留成功 (Armbian 论坛给出的做法).
-      # 该参数作用于宿主机内核, 容器内的 qemu 同样受益.
+      # Round 6 的结论 (overcommit) 是错的: 上一轮 vm.overcommit_memory=1 已生效,
+      # 但本轮仍然在同一步 (apt_lists_copy_from_host_to_image_and_update,
+      # apt-install.sh:67) 报 getline ENOMEM(12)。
+      # 真实条件是: x86_64 容器里用 qemu-aarch64-static 跑 arm64 apt, 且 rootfs
+      # 建在 tmpfs 上(日志 L23935 "Using tmpfs for rootfs build")。
+      # 这类"guest 系统调用 → 宿主 read()/mmap 返回 ENOMEM"的问题没有确定性参数可调,
+      # 消掉它唯一可靠的办法是让 qemu 彻底不参与 —— 即 arm64 原生 runner。
       # ============================================================
-      - name: Host tuning for qemu-user (apt getline ENOMEM fix)
-        run: |
-          set +e
-          sudo sysctl -w vm.overcommit_memory=1
-          echo "vm.overcommit_memory=$(cat /proc/sys/vm/overcommit_memory)"
-          free -h || true
 
-      # ============================================================
-      # Round 6: apt 源 / lists 快照
-      # 注意作用域: image 里的 /var/lib/apt/lists 是 cp -pr 自"容器"的 lists
-      # (见 apt-install.sh 的 apt_lists_copy_from_host_to_image_and_update),
-      # 所以在 runner 宿主机上删源并不会影响容器 — 删源这条路无效.
-      # 这里先记录宿主机侧作对照, 并判断那个失败文件在本机是否存在/多大.
-      # ============================================================
-      - name: Dump apt sources and lists (diagnostics)
-        run: |
-          REPORT="${GITHUB_WORKSPACE}/apt-report.txt"
-          {
-            echo "=== HOST apt sources ==="
-            ls -la /etc/apt/sources.list.d/ 2>/dev/null || true
-            grep -rn "configng\|github.armbian.com" /etc/apt/ 2>/dev/null | head -20 || true
-            echo "=== HOST /var/lib/apt/lists ==="
-            du -sh /var/lib/apt/lists 2>/dev/null || true
-            ls -la /var/lib/apt/lists 2>/dev/null | head -30 || true
-            echo "=== suspect file on host ==="
-            F=/var/lib/apt/lists/github.armbian.com_configng_dists_stable_InRelease
-            if [ -f "$F" ]; then
-              ls -l "$F" || true
-              echo "size=$(stat -c %s "$F" 2>/dev/null) lines=$(wc -l < "$F" 2>/dev/null)"
-              head -c 200 "$F" | od -c | head -5 || true
-            else
-              echo "not present on host (exists only inside the build container)"
-            fi
-          } | tee "$REPORT"
-
-      # ============================================================
-      # Round 5: 磁盘守门 — 编译前必须有 >= 12GiB 可用
-      # armbian 自己的门槛是 10GiB (prepare-host.sh:347 硬编码), 但 10GiB 只够它启动,
-      # 内核+rootfs+debootstrap 峰值约 8-11GiB, 所以这里留 2GiB 余量.
-      # 宁可 30 秒失败, 也不要等 60 分钟后死在 apt 里.
-      # ============================================================
-      - name: Disk gate before compile (>=12GiB) + snapshot
+      # Round 7: 原来的 "Dump apt sources" 和 "12GiB disk gate" 都删掉了:
+      #   - 源: 失败与源内容无关 (curl 该 InRelease = HTTP 200 / 6225 字节 / 合法 PGP),
+      #         且原生 arm64 宿主上完全不会触发;
+      #   - gate: armbian 自己在 prepare-host.sh L340-353 有 10GiB fail-fast (exit 43),
+      #         实测机器 110GiB 空闲, 再守一道门只是增加复杂度。
+      - name: Snapshot disk before compile
         run: |
           REPORT="${GITHUB_WORKSPACE}/disk-report.txt"
-          FREE_GIB=$(df -BG --output=avail "${ARMBIAN_BUILD_DIR}" 2>/dev/null | tail -1 | tr -dc '0-9')
-          FREE_GIB=${FREE_GIB:-0}
-
           {
-            echo "=============================================="
             echo "=== BEFORE compile  $(date -u +%FT%TZ) ==="
-            echo "=============================================="
             df -h / || true
             df -h "${ARMBIAN_BUILD_DIR}" || true
-            [ -d /mnt ] && df -h /mnt || true
-            echo "--- du key dirs (before) ---"
-            du -sh "${ARMBIAN_BUILD_DIR}/" 2>/dev/null || true
-            du -sh "${ARMBIAN_BUILD_DIR}/cache/sources" 2>/dev/null || true
-            du -sh "${ARMBIAN_BUILD_DIR}/cache" 2>/dev/null || true
-            du -sh "${ARMBIAN_BUILD_DIR}/output" 2>/dev/null || true
-            du -sh "${ARMBIAN_BUILD_DIR}/userpatches" 2>/dev/null || true
+            du -sh "${ARMBIAN_BUILD_DIR}" 2>/dev/null || true
             du -sh /var/lib/docker 2>/dev/null || true
-            echo "free=${FREE_GIB}GiB"
-          } | tee -a "$REPORT"
-
-          echo ""
-          echo "=== Disk gate: ${FREE_GIB}GiB free, need >= 12GiB ==="
-          if [ "${FREE_GIB}" -lt 12 ]; then
-            echo "::error ::runner disk too small for this build: only ${FREE_GIB}GiB free, need >=12GiB. Use a larger runner (see commented runs-on example) or a self-hosted runner."
-            exit 1
-          fi
+          } | tee "$REPORT"
 
       # ============================================================
       # compile.sh — 不套 sudo, 直接跑 (runner 默认 root)
@@ -606,7 +434,6 @@ jobs:
           name: disk-report-${{ github.run_number }}
           path: |
             ${{ github.workspace }}/disk-report.txt
-            ${{ github.workspace }}/apt-report.txt
           retention-days: 14
           if-no-files-found: ignore
 
