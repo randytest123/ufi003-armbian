@@ -63,8 +63,8 @@ on:
         default: "yes"
         type: choice
         options:
-          - yes
-          - no
+          - "yes"
+          - "no"
 
   push:
     branches: [main]
