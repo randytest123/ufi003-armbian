@@ -1,0 +1,40 @@
+=== HOST apt sources ===
+total 16
+drwxr-xr-x 2 root root 4096 Oct 25 21:37 .
+drwxr-xr-x 8 root root 4096 Oct 25 21:05 ..
+-rw-r--r-- 1 root root  138 Oct 25 21:19 microsoft-prod.list
+-rw-r--r-- 1 root root 2995 Nov  4 16:41 ubuntu.sources
+=== HOST /var/lib/apt/lists ===
+206M	/var/lib/apt/lists
+total 210088
+drwxr-xr-x 4 root root    20480 Nov  4 16:46 .
+drwxr-xr-x 5 root root     4096 Nov  4 16:47 ..
+-rw-r--r-- 1 root root   126173 Nov  3 12:41 _etc_apt_apt-mirrors.txt_dists_noble-backports_InRelease
+-rw-r--r-- 1 root root   255999 Sep 20 23:12 _etc_apt_apt-mirrors.txt_dists_noble-backports_main_binary-amd64_Packages
+-rw-r--r-- 1 root root      902 Jun 11 17:56 _etc_apt_apt-mirrors.txt_dists_noble-backports_main_cnf_Commands-amd64
+-rw-r--r-- 1 root root   121051 Apr 21  2026 _etc_apt_apt-mirrors.txt_dists_noble-backports_main_i18n_Translation-en
+-rw-r--r-- 1 root root     1062 Oct 12 12:28 _etc_apt_apt-mirrors.txt_dists_noble-backports_multiverse_binary-amd64_Packages
+-rw-r--r-- 1 root root       59 Jan  4  2024 _etc_apt_apt-mirrors.txt_dists_noble-backports_multiverse_cnf_Commands-amd64
+-rw-r--r-- 1 root root      394 Apr 21  2026 _etc_apt_apt-mirrors.txt_dists_noble-backports_multiverse_i18n_Translation-en
+-rw-r--r-- 1 root root       59 Jan  4  2024 _etc_apt_apt-mirrors.txt_dists_noble-backports_restricted_cnf_Commands-amd64
+-rw-r--r-- 1 root root   144274 Sep 20 23:12 _etc_apt_apt-mirrors.txt_dists_noble-backports_universe_binary-amd64_Packages
+-rw-r--r-- 1 root root     7862 Jun 11 17:56 _etc_apt_apt-mirrors.txt_dists_noble-backports_universe_cnf_Commands-amd64
+-rw-r--r-- 1 root root    67348 Sep 20 23:12 _etc_apt_apt-mirrors.txt_dists_noble-backports_universe_i18n_Translation-en
+-rw-r--r-- 1 root root   126127 Nov  3 17:28 _etc_apt_apt-mirrors.txt_dists_noble-security_InRelease
+-rw-r--r-- 1 root root  6288086 Nov  3 16:36 _etc_apt_apt-mirrors.txt_dists_noble-security_main_binary-amd64_Packages
+-rw-r--r-- 1 root root    49133 Jul  6 17:06 _etc_apt_apt-mirrors.txt_dists_noble-security_main_cnf_Commands-amd64
+-rw-r--r-- 1 root root  3880964 Nov  3 16:36 _etc_apt_apt-mirrors.txt_dists_noble-security_main_i18n_Translation-en
+-rw-r--r-- 1 root root   341833 Oct 12 07:19 _etc_apt_apt-mirrors.txt_dists_noble-security_multiverse_binary-amd64_Packages
+-rw-r--r-- 1 root root     2282 Jun  3 13:23 _etc_apt_apt-mirrors.txt_dists_noble-security_multiverse_cnf_Commands-amd64
+-rw-r--r-- 1 root root   162918 Nov  2 12:59 _etc_apt_apt-mirrors.txt_dists_noble-security_multiverse_i18n_Translation-en
+-rw-r--r-- 1 root root 10235066 Nov  2 14:21 _etc_apt_apt-mirrors.txt_dists_noble-security_restricted_binary-amd64_Packages
+-rw-r--r-- 1 root root     3251 Jun  3 13:22 _etc_apt_apt-mirrors.txt_dists_noble-security_restricted_cnf_Commands-amd64
+-rw-r--r-- 1 root root  7409408 Nov  2 14:21 _etc_apt_apt-mirrors.txt_dists_noble-security_restricted_i18n_Translation-en
+-rw-r--r-- 1 root root  7685583 Nov  3 17:28 _etc_apt_apt-mirrors.txt_dists_noble-security_universe_binary-amd64_Packages
+-rw-r--r-- 1 root root   206101 Jul  6 14:13 _etc_apt_apt-mirrors.txt_dists_noble-security_universe_cnf_Commands-amd64
+-rw-r--r-- 1 root root  2727017 Nov  3 17:28 _etc_apt_apt-mirrors.txt_dists_noble-security_universe_i18n_Translation-en
+-rw-r--r-- 1 root root   126125 Nov  3 18:29 _etc_apt_apt-mirrors.txt_dists_noble-updates_InRelease
+-rw-r--r-- 1 root root  7615549 Nov  3 18:29 _etc_apt_apt-mirrors.txt_dists_noble-updates_main_binary-amd64_Packages
+-rw-r--r-- 1 root root    68447 Jul  4 21:46 _etc_apt_apt-mirrors.txt_dists_noble-updates_main_cnf_Commands-amd64
+=== suspect file on host ===
+not present on host (exists only inside the build container)
