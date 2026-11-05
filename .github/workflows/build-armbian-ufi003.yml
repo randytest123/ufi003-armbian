@@ -515,32 +515,59 @@ jobs:
           sudo mount "$BOOT_LOOP" "$BOOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          # kernel
-          if find "$ROOT_M/boot" -maxdepth 1 -name "Image" | grep -q .; then
-              sudo cp "$ROOT_M/boot/Image" "$BOOT_M/"
+          # kernel — boot 分区只有 64MiB (GPT boot=131072 sectors), 放不下
+          # 未压缩 Image(≈35MB) + initrd(≈25MB) (Round 8 实测: cp initrd 时
+          # "No space left on device")。改用 gzip 压缩内核 Image.gz:
+          # lk2nd/boot/extlinux.c L578 `is_gzip_package()` + L581 `decompress()`
+          # 原生支持 gzip 内核, 启动时自动解压, 不改变 extlinux 语义。
+          if [[ -f "$ROOT_M/boot/Image" ]]; then
+              SRC_KERNEL="$ROOT_M/boot/Image"
           else
-              KERNEL=$(ls "$ROOT_M/boot"/vmlinuz-* 2>/dev/null | head -1)
-              [[ -n "$KERNEL" ]] && sudo cp "$KERNEL" "$BOOT_M/Image"
+              SRC_KERNEL=$(ls "$ROOT_M/boot"/vmlinuz-* 2>/dev/null | head -1)
           fi
+          if [[ -z "$SRC_KERNEL" || ! -f "$SRC_KERNEL" ]]; then
+              echo "FATAL: no kernel found in rootfs /boot"; exit 1
+          fi
+          echo "kernel source: $SRC_KERNEL ($(stat -c%s "$SRC_KERNEL") bytes)"
+          sudo gzip -9 -c "$SRC_KERNEL" | sudo tee "$BOOT_M/Image.gz" >/dev/null
+          ls -la "$BOOT_M/Image.gz"
 
           # initrd
-          INITRD=$(find "$ROOT_M/boot" -maxdepth 1 -name "initrd*" | head -1)
-          [[ -n "$INITRD" ]] && sudo cp "$INITRD" "$BOOT_M/initrd.img" || true
+          INITRD=$(find "$ROOT_M/boot" -maxdepth 1 -type f -name "initrd*" | head -1)
+          if [[ -n "$INITRD" ]]; then
+              echo "initrd source: $INITRD ($(stat -c%s "$INITRD") bytes)"
+              sudo cp "$INITRD" "$BOOT_M/initrd.img"
+          else
+              echo "FATAL: no initrd found in rootfs /boot"; exit 1
+          fi
 
-          # dtb
+          # dtb — 必须是 UFI003 自己的 dtb。Round 7 的兜底 `*/dtb/qcom/msm8916*.dtb`
+          # 会匹配到任意 msm8916 板子 (实测抓到了 samsung-j3ltetw.dtb), 这里收紧。
           sudo mkdir -p "$BOOT_M/dtb/qcom"
-          # find -L: /boot/dtb 是 symlink → /boot/dtb-<ver> (kernel-debs.sh L457-459 的
-          # 非 vfat 分支), 不加 -L 时 find 不会进入该 symlink, 只会看到
-          # /boot/dtb-6.12.x/qcom/..., 不匹配 "*/dtb/qcom/*", DTB 就找不到了
-          DTB=$(find -L "$ROOT_M" -path "*/dtb/qcom/*openstick*ufi003*.dtb" -o -path "*/dtb/qcom/msm8916*.dtb" 2>/dev/null | head -1)
+          DTB=""
+          for cand in \
+              msm8916-handsome-openstick-ufi003.dtb \
+              msm8916-handsome-openstick-ufi003-armbian.dtb; do
+              DTB=$(find -L "$ROOT_M" -name "$cand" 2>/dev/null | head -1)
+              [[ -n "$DTB" ]] && break
+          done
+          if [[ -z "$DTB" ]]; then
+              DTB=$(find -L "$ROOT_M" -name "*openstick*ufi003*.dtb" 2>/dev/null | head -1)
+          fi
           if [[ -n "$DTB" ]]; then
+              echo "dtb source: $DTB"
               sudo cp "$DTB" "$BOOT_M/dtb/qcom/"
               DTB_NAME=$(basename "$DTB")
           else
+              echo "WARN: no ufi003 dtb in rootfs, compiling from repo dts"
               dtc -I dts -O dtb -o "$BOOT_M/dtb/qcom/msm8916-handsome-openstick-ufi003.dtb" \
                   msm8916-handsome-openstick-ufi003-armbian.dts
               DTB_NAME="msm8916-handsome-openstick-ufi003.dtb"
           fi
+
+          echo "=== boot.img usage ==="
+          df -h "$BOOT_M" || true
+          du -sh "$BOOT_M"/* 2>/dev/null || true
 
           # extlinux.conf — printf 拼接, 缩进安全
           sudo mkdir -p "$BOOT_M/extlinux"
@@ -549,13 +576,13 @@ jobs:
               '# lk2nd bootloader reads this directly' \
               '' \
               'label Armbian' \
-              '    kernel /Image' \
+              '    kernel /Image.gz' \
               '    initrd /initrd.img' \
               "    fdt /dtb/qcom/${DTB_NAME}" \
               '    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw' \
               '' \
               'label Armbian (rescue)' \
-              '    kernel /Image' \
+              '    kernel /Image.gz' \
               '    initrd /initrd.img' \
               "    fdt /dtb/qcom/${DTB_NAME}" \
               '    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw single' \
@@ -627,7 +654,7 @@ jobs:
           sudo mount "$BOOT_LOOP" "$BOOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          boop "[ -f '$BOOT_M/Image' ]" "boot has kernel"
+          boop "[ -f '$BOOT_M/Image.gz' ]" "boot has kernel Image.gz"
           boop "[ -f '$BOOT_M/extlinux/extlinux.conf' ]" "boot has extlinux.conf"
           boop "find '$BOOT_M' -name '*.dtb' | grep -q ." "boot has dtb"
           boop "grep -q 'PARTLABEL=rootfs' '$BOOT_M/extlinux/extlinux.conf'" "extlinux has PARTLABEL"
