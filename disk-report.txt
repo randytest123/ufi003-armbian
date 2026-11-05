@@ -1,0 +1,34 @@
+==============================================
+=== BEFORE compile  2026-11-04T16:49:40Z ===
+==============================================
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   35G  110G  24% /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   35G  110G  24% /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   35G  110G  24% /
+--- du key dirs (before) ---
+303M	/home/runner/work/ufi003-armbian/ufi003-armbian/armbian-build/
+720K	/home/runner/work/ufi003-armbian/ufi003-armbian/armbian-build/userpatches
+4.0K	/var/lib/docker
+free=110GiB
+
+==============================================
+=== AFTER compile  2026-11-04T17:27:08Z ===
+==============================================
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   55G   91G  38% /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   55G   91G  38% /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   55G   91G  38% /
+--- du key dirs (after) ---
+12G	/home/runner/work/ufi003-armbian/ufi003-armbian/armbian-build/cache/sources
+16G	/home/runner/work/ufi003-armbian/ufi003-armbian/armbian-build/cache
+269M	/home/runner/work/ufi003-armbian/ufi003-armbian/armbian-build/output
+1.1M	/home/runner/work/ufi003-armbian/ufi003-armbian/armbian-build/userpatches
+4.0K	/var/lib/docker
+--- output/images ---
+total 8
+drwxr-xr-x 2 runner runner 4096 Nov  4 16:50 .
+drwxr-xr-x 7 runner runner 4096 Nov  4 16:51 ..
