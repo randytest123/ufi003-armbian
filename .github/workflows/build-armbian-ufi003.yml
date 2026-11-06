@@ -389,6 +389,111 @@ jobs:
           echo "elapsed_minutes=${ELAPSED}" >> "$GITHUB_OUTPUT"
           echo "compile.sh OK, ${IMG_COUNT} img files produced"
 
+      # ============================================================
+      # Round 9 (A): 定位构建产物里的裸 arm64 Image + 硬断言
+      #
+      # 根因: 之前 assemble 从 rootfs /boot/Image 取内核, 拿到的是
+      # ARM64 PE/EFI 可执行文件 (首字节 'MZ'), aboot 原样搬到
+      # 0x80080000 跳转 → 非法指令 → 复位.
+      # 现在 CONFIG_EFI/EFI_STUB/ZBOOT 已强制 =n, 必须产出标准裸 Image:
+      #   code0 = d503201f (NOP), magic[56:60] = 'ARMd'
+      # 任一断言失败 → 构建直接失败 (不再回退到 rootfs /boot/Image).
+      # 找到后复制到 output/images/Image, 随 artifact 交给 assemble job.
+      # ============================================================
+      - name: Locate + assert raw arm64 Image (must NOT be PE/MZ)
+        run: |
+          set -euo pipefail
+          OUT="${ARMBIAN_BUILD_DIR}/output"
+          IMG=""
+
+          # 1) armbian-next 构建产物 output/images/Image
+          if [[ -f "${OUT}/images/Image" ]]; then
+              IMG="${OUT}/images/Image"
+              echo "Image source: output/images/Image"
+          fi
+
+          # 2) 内核源码树 arch/arm64/boot/Image (armbian 保留 cache/sources)
+          if [[ -z "$IMG" ]]; then
+              IMG=$(find "${ARMBIAN_BUILD_DIR}/cache/sources" "${OUT}" \
+                        -type f -path "*/arch/arm64/boot/Image" 2>/dev/null | head -1 || true)
+              [[ -n "$IMG" ]] && echo "Image source: $IMG"
+          fi
+
+          # 3) 从 linux-image deb 里取 (仍需通过下面的断言)
+          if [[ -z "$IMG" ]]; then
+              DEB=$(find "${OUT}/debs" -type f -name 'linux-image-*.deb' 2>/dev/null | head -1 || true)
+              if [[ -n "$DEB" ]]; then
+                  echo "Image source: extract from ${DEB}"
+                  rm -rf /tmp/kdeb && mkdir -p /tmp/kdeb
+                  dpkg-deb -x "$DEB" /tmp/kdeb
+                  IMG=$(find /tmp/kdeb/boot -maxdepth 1 -type f \( -name Image -o -name 'vmlinuz-*' \) 2>/dev/null | head -1 || true)
+                  [[ -n "$IMG" ]] && echo "  extracted: $IMG"
+              fi
+          fi
+
+          if [[ -z "$IMG" || ! -f "$IMG" ]]; then
+              echo "FATAL: no arm64 Image found in build artifacts"
+              echo "--- output tree (maxdepth 4) ---"
+              find "$OUT" -maxdepth 4 -type f 2>/dev/null | head -80 || true
+              echo "--- cache/sources kernel dirs ---"
+              find "${ARMBIAN_BUILD_DIR}/cache/sources" -maxdepth 2 -type d -name 'linux-*' 2>/dev/null | head -10 || true
+              exit 1
+          fi
+
+          mkdir -p "${OUT}/images"
+          if [[ "$IMG" != "${OUT}/images/Image" ]]; then
+              cp "$IMG" "${OUT}/images/Image"
+          fi
+          IMG="${OUT}/images/Image"
+
+          echo ""
+          echo "=== Raw Image assertion ==="
+          ls -l "$IMG"
+          python3 - "$IMG" <<'PY'
+          import os
+          import struct
+          import sys
+
+          p = sys.argv[1]
+          size = os.path.getsize(p)
+          h = open(p, 'rb').read(64)
+          w0, w1 = struct.unpack('<II', h[0:8])
+          text_offset, image_size, flags, _r2, _r3, _r4 = struct.unpack('<QQQQQQ', h[8:56])
+          magic = h[56:60]
+
+          print("  file path     : %s" % p)
+          print("  file size     : %d bytes" % size)
+          print("  code0         : 0x%08x  (must be 0xd503201f NOP)" % w0)
+          print("  code1         : 0x%08x  (branch to primary_entry)" % w1)
+          print("  text_offset   : 0x%x" % text_offset)
+          print("  image_size    : 0x%x (%d bytes)" % (image_size, image_size))
+          print("  flags         : 0x%x" % flags)
+          print("  magic[56:60]  : %r  (must be b'ARMd')" % magic)
+
+          fail = []
+          if h[:2] == b'MZ':
+              fail.append("first 2 bytes are 'MZ' -> PE/EFI vmlinuz, NOT a raw Image")
+          if w0 != 0xd503201f:
+              fail.append("code0=0x%08x != 0xd503201f (NOP)" % w0)
+          if magic != b'ARMd':
+              fail.append("magic=%r != b'ARMd'" % magic)
+          # 注意: arm64 Image 的 image_size 允许比文件本身大 (含 bss/对齐)
+          # 实测 EFI stub 内核: file=54026752, image_size=54919168 (+892416).
+          if image_size == 0:
+              fail.append("image_size=0 invalid")
+          elif image_size > size:
+              print("  NOTE: image_size > file size (+%d bytes, bss/padding)" % (image_size - size))
+              if image_size > size + 32 * 1024 * 1024:
+                  fail.append("image_size=%d 超出文件大小 32MiB 以上, 可疑" % image_size)
+          if flags != 0xa:
+              print("  WARN: flags=0x%x (factory kernel uses 0xa)" % flags)
+
+          for m in fail:
+              print("FATAL: " + m)
+          sys.exit(1 if fail else 0)
+          PY
+          echo "=== Raw Image assertion PASSED ==="
+
       # Round 5: ccache save 关闭 (理由同上方 Restore ccache)
       # - name: Save ccache
       #   if: always()
@@ -500,109 +605,164 @@ jobs:
           echo "ROOTFS=${ROOTFS}" >> "$GITHUB_OUTPUT"
           echo "Rootfs img: $(stat -c%s "$ROOTFS") bytes"
 
-      - name: Build boot.img (FAT32 + kernel + dtb + extlinux.conf)
+      # ============================================================
+      # Round 9 (A): AOSP boot image v0
+      #   kernel 段 = gzip -9 Image + dtb 拼在 gzip 流之后
+      #   (aboot: is_gzip_package() → decompress() 返回 dtb_offset,
+      #    之后 dev_tree_appended() 在压缩流末尾找 dtb)
+      #   header: page 2048 / kernel 0x80080000 / ramdisk 0x84000000 /
+      #           tags 0x83800000 / header_version 0
+      # 内核只从构建产物取, 绝不再从 rootfs /boot/Image 取 (那是 PE 文件).
+      # ============================================================
+      - name: Build boot.img — AOSP v0 (gzip Image + appended dtb + initrd)
         run: |
+          set -euo pipefail
           ROOTFS="${{ steps.decompress.outputs.ROOTFS }}"
 
-          dd if=/dev/zero of=boot.img bs=1M count=64 status=none
-          mkfs.fat -F 32 -n UFI003_BOOT boot.img >/dev/null 2>&1
+          # ---- 1. 内核: 只从构建产物取 ----
+          KERNEL_IMG=$(find armbian-output -type f -name Image | head -1)
+          if [[ -z "$KERNEL_IMG" || ! -f "$KERNEL_IMG" ]]; then
+              echo "FATAL: no Image in build artifact"
+              find armbian-output -type f | head -50
+              exit 1
+          fi
+          echo "kernel source: $KERNEL_IMG ($(stat -c%s "$KERNEL_IMG") bytes)"
 
-          BOOT_LOOP=$(sudo losetup -fP --show boot.img)
+          # 硬断言 (assemble 阶段再验一次, 防止 artifact 传错)
+          if [[ "$(head -c2 "$KERNEL_IMG")" == "MZ" ]]; then
+              echo "FATAL: Image starts with 'MZ' (PE/EFI) — refusing to pack"; exit 1
+          fi
+          W0=$(od -An -tx4 -N4 "$KERNEL_IMG" | tr -d ' \n')
+          if [[ "$W0" != "d503201f" ]]; then
+              echo "FATAL: Image code0=$W0 != d503201f — not a raw arm64 Image"; exit 1
+          fi
+          echo "  code0=0x$W0 OK"
+
+          # ---- 2. 挂 rootfs 取 initrd + dtb ----
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS")
-          BOOT_M=/mnt/ufi003-boot
           ROOT_M=/mnt/ufi003-rootfs
-          sudo mkdir -p "$BOOT_M" "$ROOT_M"
-          sudo mount "$BOOT_LOOP" "$BOOT_M"
+          sudo mkdir -p "$ROOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          # kernel — boot 分区只有 64MiB (GPT boot=131072 sectors), 放不下
-          # 未压缩 Image(≈35MB) + initrd(≈25MB) (Round 8 实测: cp initrd 时
-          # "No space left on device")。改用 gzip 压缩内核 Image.gz:
-          # lk2nd/boot/extlinux.c L578 `is_gzip_package()` + L581 `decompress()`
-          # 原生支持 gzip 内核, 启动时自动解压, 不改变 extlinux 语义。
-          if [[ -f "$ROOT_M/boot/Image" ]]; then
-              SRC_KERNEL="$ROOT_M/boot/Image"
-          else
-              SRC_KERNEL=$(ls "$ROOT_M/boot"/vmlinuz-* 2>/dev/null | head -1)
-          fi
-          if [[ -z "$SRC_KERNEL" || ! -f "$SRC_KERNEL" ]]; then
-              echo "FATAL: no kernel found in rootfs /boot"; exit 1
-          fi
-          echo "kernel source: $SRC_KERNEL ($(stat -Lc%s "$SRC_KERNEL") bytes)"
-          sudo gzip -9 -c "$SRC_KERNEL" | sudo tee "$BOOT_M/Image.gz" >/dev/null
-          ls -la "$BOOT_M/Image.gz"
-
-          # initrd
-          INITRD=$(find "$ROOT_M/boot" -maxdepth 1 -type f -name "initrd*" | head -1)
-          if [[ -n "$INITRD" ]]; then
-              echo "initrd source: $INITRD ($(stat -c%s "$INITRD") bytes)"
-              sudo cp "$INITRD" "$BOOT_M/initrd.img"
-          else
+          INITRD=$(find -L "$ROOT_M/boot" -maxdepth 1 -type f -name "initrd*" 2>/dev/null | head -1 || true)
+          if [[ -z "$INITRD" ]]; then
               echo "FATAL: no initrd found in rootfs /boot"; exit 1
           fi
+          echo "initrd source: $INITRD ($(stat -c%s "$INITRD") bytes)"
 
-          # dtb — 必须是 UFI003 自己的 dtb。Round 7 的兜底 `*/dtb/qcom/msm8916*.dtb`
-          # 会匹配到任意 msm8916 板子 (实测抓到了 samsung-j3ltetw.dtb), 这里收紧。
-          sudo mkdir -p "$BOOT_M/dtb/qcom"
+          # dtb — 必须是 UFI003 自己的 dtb (收紧匹配, 不要任意 msm8916 dtb)
           DTB=""
           for cand in \
               msm8916-handsome-openstick-ufi003.dtb \
               msm8916-handsome-openstick-ufi003-armbian.dtb; do
-              DTB=$(find -L "$ROOT_M" -name "$cand" 2>/dev/null | head -1)
+              DTB=$(find -L "$ROOT_M" -name "$cand" 2>/dev/null | head -1 || true)
               [[ -n "$DTB" ]] && break
           done
           if [[ -z "$DTB" ]]; then
-              DTB=$(find -L "$ROOT_M" -name "*openstick*ufi003*.dtb" 2>/dev/null | head -1)
+              DTB=$(find -L "$ROOT_M" -name "*openstick*ufi003*.dtb" 2>/dev/null | head -1 || true)
           fi
           if [[ -n "$DTB" ]]; then
-              echo "dtb source: $DTB"
-              sudo cp "$DTB" "$BOOT_M/dtb/qcom/"
-              DTB_NAME=$(basename "$DTB")
+              echo "dtb source: $DTB ($(stat -c%s "$DTB") bytes)"
           else
               echo "WARN: no ufi003 dtb in rootfs, compiling from repo dts"
-              dtc -I dts -O dtb -o "$BOOT_M/dtb/qcom/msm8916-handsome-openstick-ufi003.dtb" \
-                  msm8916-handsome-openstick-ufi003-armbian.dts
-              DTB_NAME="msm8916-handsome-openstick-ufi003.dtb"
+              DTB=/tmp/ufi003-repo.dtb
+              dtc -I dts -O dtb -o "$DTB" msm8916-handsome-openstick-ufi003-armbian.dts
           fi
 
-          echo "=== boot.img usage ==="
-          df -h "$BOOT_M" || true
-          du -sh "$BOOT_M"/* 2>/dev/null || true
+          python3 - "$DTB" <<'PY'
+          import struct, sys
+          d = open(sys.argv[1], 'rb').read()
+          # FDT 头是大端 (magic 0xd00dfeed 在文件里是 d0 0d fe ed)
+          magic, totalsize = struct.unpack('>II', d[:8])
+          print("  dtb magic=0x%08x totalsize=%d file=%d" % (magic, totalsize, len(d)))
+          if magic != 0xd00dfeed:
+              print("FATAL: dtb magic != 0xd00dfeed"); sys.exit(1)
+          if totalsize != len(d):
+              print("  WARN: dtb totalsize != file size (trailing padding)")
+          PY
 
-          # extlinux.conf — printf 拼接, 缩进安全
-          sudo mkdir -p "$BOOT_M/extlinux"
-          printf '%s\n' \
-              '# extlinux.conf — UFI003 OpenStick (no-modem Armbian)' \
-              '# lk2nd bootloader reads this directly' \
-              '' \
-              'label Armbian' \
-              '    kernel /Image.gz' \
-              '    initrd /initrd.img' \
-              "    fdt /dtb/qcom/${DTB_NAME}" \
-              '    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw' \
-              '' \
-              'label Armbian (rescue)' \
-              '    kernel /Image.gz' \
-              '    initrd /initrd.img' \
-              "    fdt /dtb/qcom/${DTB_NAME}" \
-              '    append earlycon root=/dev/disk/by-partlabel/rootfs console=ttyMSM0,115200 rootwait no_framebuffer=true rw single' \
-              '' \
-              | sudo tee "$BOOT_M/extlinux/extlinux.conf" >/dev/null
+          echo "=== dtb model (人工核对) ==="
+          strings "$DTB" 2>/dev/null | grep -m3 -iE 'Handsome OpenStick|UFI003' || echo "  (model string not found — WARN only)"
 
-          echo "=== Generated extlinux.conf ==="
-          cat "$BOOT_M/extlinux/extlinux.conf"
+          # ---- 3. kernel 段 = gzip -9 Image || dtb ----
+          gzip -9 -c "$KERNEL_IMG" > /tmp/Image.gz
+          cat /tmp/Image.gz "$DTB" > /tmp/kernel-dtb.bin
+          KSIZE=$(stat -c%s /tmp/kernel-dtb.bin)
+          RSIZE=$(stat -c%s "$INITRD")
+          echo "  Image.gz            : $(stat -c%s /tmp/Image.gz) bytes"
+          echo "  dtb                 : $(stat -c%s "$DTB") bytes"
+          echo "  kernel_size(gz+dtb) : $KSIZE bytes"
+          echo "  ramdisk_size        : $RSIZE bytes"
+
+          # ---- 4. 尺寸 / 地址硬约束 ----
+          # boot 分区 64 MiB → payload 上限 63 MiB 留余量;
+          # 裸 Image 解压后落在 0x80080000, 不能越过 tags_addr / ramdisk_addr.
+          python3 - "$KERNEL_IMG" "$KSIZE" "$RSIZE" <<'PY'
+          import os, struct, sys
+
+          p, ksize, rsize = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          h = open(p, 'rb').read(64)
+          image_size = struct.unpack('<Q', h[16:24])[0]
+          kernel_addr, ramdisk_addr, tags_addr = 0x80080000, 0x84000000, 0x83800000
+          page = 2048
+          img_end = kernel_addr + image_size
+          total = ((page + ksize + rsize + page - 1) // page) * page
+
+          print("  image_size=%d (0x%x), decompressed end=0x%x" % (image_size, image_size, img_end))
+          print("  boot.img total=%d bytes (%.2f MiB)" % (total, total / 1048576.0))
+          fail = []
+          if ksize + rsize > 63 * 1024 * 1024:
+              fail.append("payload %d > 63 MiB" % (ksize + rsize))
+          if total > 64 * 1024 * 1024:
+              fail.append("boot.img %d > 64 MiB" % total)
+          if img_end >= tags_addr:
+              fail.append("kernel end 0x%x >= tags_addr 0x%x" % (img_end, tags_addr))
+          if img_end >= ramdisk_addr:
+              fail.append("kernel end 0x%x >= ramdisk_addr 0x%x" % (img_end, ramdisk_addr))
+          for m in fail:
+              print("FATAL: " + m)
+          sys.exit(1 if fail else 0)
+          PY
+
+          # ---- 5. AOSP boot v0 头 + 打包 ----
+          mkdir -p output/fastboot
+          python3 - /tmp/kernel-dtb.bin "$INITRD" output/fastboot/boot.img <<'PY'
+          import struct, sys
+
+          kpath, rpath, out = sys.argv[1], sys.argv[2], sys.argv[3]
+          PAGE = 2048
+          KERNEL_ADDR, RAMDISK_ADDR, TAGS_ADDR = 0x80080000, 0x84000000, 0x83800000
+          CMDLINE = (b"earlycon root=PARTUUID=a7ab80e8-e9d1-e8cd-f157-93f69b1d141e "
+                     b"console=ttyMSM0,115200 rootwait no_framebuffer=true rw")
+
+          k = open(kpath, 'rb').read()
+          r = open(rpath, 'rb').read()
+
+          hdr = struct.pack('<8s10I16s512s32s1024s',
+                            b'ANDROID!',
+                            len(k), KERNEL_ADDR,      # kernel_size, kernel_addr
+                            len(r), RAMDISK_ADDR,     # ramdisk_size, ramdisk_addr
+                            0, 0,                     # second_size, second_addr
+                            TAGS_ADDR, PAGE,
+                            0, 0,                     # header_version, os_version
+                            b'UFI003', CMDLINE, b'\0' * 32, b'\0' * 1024)
+          assert len(hdr) == 1632, len(hdr)
+
+          body = hdr + b'\0' * (PAGE - len(hdr)) + k + r
+          body += b'\0' * ((-len(body)) % PAGE)
+          open(out, 'wb').write(body)
+
+          print("  boot.img       : %d bytes (%.2f MiB)" % (len(body), len(body) / 1048576.0))
+          print("  kernel_size    : %d  @ 0x%x" % (len(k), KERNEL_ADDR))
+          print("  ramdisk_size   : %d  @ 0x%x" % (len(r), RAMDISK_ADDR))
+          print("  tags_addr      : 0x%x  page=%d  header_version=0" % (TAGS_ADDR, PAGE))
+          print("  cmdline        : %s" % CMDLINE.decode())
+          PY
+
+          ls -l output/fastboot/boot.img
 
           sudo sync
-          sudo umount "$BOOT_M"
           sudo umount "${ROOTFS_LOOP}p1" 2>/dev/null || sudo umount "$ROOT_M"
-
-          mkdir -p output/fastboot
-          cp boot.img output/fastboot/boot.img
-          # rootfs.img 的 dd 移到 "Patch rootfs /etc/fstab" step 之后再做:
-          # Round 8 实测这里先 dd 出来的副本仍是未改 fstab 的旧内容, verify 会
-          # 报 "rootfs fstab correct" FAIL (run 41965286420)。
-
-          sudo losetup -d "$BOOT_LOOP"
           sudo losetup -d "$ROOTFS_LOOP"
 
       - name: Patch rootfs /etc/fstab (PARTLABEL=rootfs)
@@ -641,6 +801,7 @@ jobs:
 
       - name: Verify artifacts
         run: |
+          set -uo pipefail
           BOOT_IMG="output/fastboot/boot.img"
           ROOTFS_IMG="output/fastboot/rootfs.img"
           PASS=0; FAIL=0
@@ -649,26 +810,79 @@ jobs:
 
           boop "[ -f '$BOOT_IMG' ] && [ \$(stat -c%s '$BOOT_IMG') -le 67108864 ]" "boot.img <= 64MB"
           boop "[ -f '$ROOTFS_IMG' ]" "rootfs.img exists"
-          boop "file '$BOOT_IMG' | grep -qi 'FAT'" "boot.img is FAT"
 
-          BOOT_LOOP=$(sudo losetup -fP --show "$BOOT_IMG")
+          # ---- AOSP boot v0 头 + kernel 段内容校验 ----
+          python3 - "$BOOT_IMG" <<'PY'
+          import struct, sys, zlib
+
+          p = sys.argv[1]
+          d = open(p, 'rb').read()
+          h = d[:1632]
+          magic = h[:8]
+          ks, ka, rs, ra, ss, sa, ta, pg, hv, osv = struct.unpack('<10I', h[8:48])
+          cmd = h[64:576].split(b'\0')[0].decode('ascii', 'replace')
+
+          print("  boot.img size : %d bytes" % len(d))
+          print("  magic         : %r" % magic)
+          print("  kernel_size   : %d @ 0x%x" % (ks, ka))
+          print("  ramdisk_size  : %d @ 0x%x" % (rs, ra))
+          print("  tags_addr     : 0x%x  page=%d  header_version=%d" % (ta, pg, hv))
+          print("  cmdline       : %s" % cmd)
+
+          ok = True
+          def chk(name, cond):
+              global ok
+              print(("  OK:   " if cond else "  FAIL: ") + name)
+              if not cond:
+                  ok = False
+
+          chk("magic == ANDROID!", magic == b'ANDROID!')
+          chk("page_size == 2048", pg == 2048)
+          chk("kernel_addr == 0x80080000", ka == 0x80080000)
+          chk("ramdisk_addr == 0x84000000", ra == 0x84000000)
+          chk("tags_addr == 0x83800000", ta == 0x83800000)
+          chk("header_version == 0", hv == 0)
+          chk("second_size == 0", ss == 0)
+          chk("cmdline root=PARTUUID a7ab80e8-...", "root=PARTUUID=a7ab80e8-e9d1-e8cd-f157-93f69b1d141e" in cmd)
+          chk("cmdline 不再依赖 by-partlabel/udev", "by-partlabel" not in cmd)
+          chk("payload <= 63 MiB", ks + rs <= 63 * 1024 * 1024)
+          chk("boot.img <= 64 MiB", len(d) <= 64 * 1024 * 1024)
+
+          kseg = d[pg:pg + ks]
+          rseg = d[pg + ks:pg + ks + rs]
+          chk("initrd 段长度正确且非空", len(rseg) == rs and rs > 0)
+          chk("kernel 段含 dtb magic", b'\xd0\x0d\xfe\xed' in kseg)
+
+          try:
+              obj = zlib.decompressobj(31)
+              dec = obj.decompress(kseg) + obj.flush()
+          except Exception as e:
+              dec = b''
+              print("  gzip error: %s" % e)
+
+          w0 = struct.unpack('<I', dec[:4])[0] if len(dec) >= 4 else 0
+          dsize = struct.unpack('<Q', dec[16:24])[0] if len(dec) >= 24 else 0
+          print("  gzip payload decompressed: %d bytes, code0=0x%08x, image_size=0x%x" % (len(dec), w0, dsize))
+          chk("gzip kernel 可解压", len(dec) > 0)
+          chk("解压后 code0 == d503201f", w0 == 0xd503201f)
+          chk("解压后 image_size > 0", dsize > 0)
+          # image_size 可大于实际解压长度 (含 bss), 允许 32MiB 内差异
+          chk("image_size 与实际解压长度相差 <= 32MiB", abs(dsize - len(dec)) <= 32 * 1024 * 1024)
+
+          sys.exit(0 if ok else 1)
+          PY
+          if [[ $? -eq 0 ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+
           ROOTFS_LOOP=$(sudo losetup -fP --show "$ROOTFS_IMG")
-          boop "file '$ROOTFS_IMG' | grep -qi 'ext4'" "rootfs.img is ext4"
-          BOOT_M=/mnt/vb; ROOT_M=/mnt/vr
-          sudo mkdir -p "$BOOT_M" "$ROOT_M"
-          sudo mount "$BOOT_LOOP" "$BOOT_M"
+          ROOT_M=/mnt/vr
+          sudo mkdir -p "$ROOT_M"
           sudo mount "${ROOTFS_LOOP}p1" "$ROOT_M" 2>/dev/null || sudo mount "$ROOTFS_LOOP" "$ROOT_M"
 
-          boop "[ -f '$BOOT_M/Image.gz' ]" "boot has kernel Image.gz"
-          boop "[ -f '$BOOT_M/extlinux/extlinux.conf' ]" "boot has extlinux.conf"
-          boop "find '$BOOT_M' -name '*.dtb' | grep -q ." "boot has dtb"
-          boop "grep -qiE 'by-partlabel/rootfs|PARTLABEL=rootfs' '$BOOT_M/extlinux/extlinux.conf'" "extlinux has PARTLABEL"
+          boop "file '$ROOTFS_IMG' | grep -qi 'ext4'" "rootfs.img is ext4"
           boop "grep -qiE 'PARTLABEL=rootfs|by-partlabel/rootfs' '$ROOT_M/etc/fstab'" "rootfs fstab correct"
           boop "[ -f '$ROOT_M/sbin/init' ]" "rootfs has systemd"
 
-          sudo umount "$BOOT_M"
           sudo umount "${ROOTFS_LOOP}p1" 2>/dev/null || sudo umount "$ROOT_M"
-          sudo losetup -d "$BOOT_LOOP"
           sudo losetup -d "$ROOTFS_LOOP"
 
           echo ""
