@@ -162,6 +162,18 @@ else
   echo "  (No fragment provided or file not found)"
 fi
 
+# ---- Round 9: 强制关闭 EFI/EFI_STUB (Qualcomm aboot 只认裸 Image) ----
+# base defconfig 里 CONFIG_EFI=y / CONFIG_EFI_STUB=y, 产出的 Image 是 PE/COFF
+# 可执行文件 (首字节 'MZ'), aboot 搬到 0x80080000 直接非法指令复位.
+# 这里先删掉 .config 里已有的同名行再追加 =n, 避免 Kconfig 的
+# "override: reassigning to symbol" 重复赋值告警.
+EFI_FORCE_OFF=(CONFIG_EFI CONFIG_EFI_STUB CONFIG_EFI_ARMSTUB CONFIG_EFI_ZBOOT)
+for sym in "${EFI_FORCE_OFF[@]}"; do
+  sed -i "/^${sym}=/d" .config 2>/dev/null || true
+  echo "${sym}=n" >> .config
+  echo "  Force-append: ${sym}=n"
+done
+
 echo "  Running make olddefconfig ..."
 if ! make ARCH=arm64 ${CROSS} olddefconfig > /tmp/make_olddefconfig.log 2>&1; then
   echo "FATAL: make olddefconfig FAILED!"
@@ -230,6 +242,35 @@ else
   echo "  OK:   CONFIG_ count=${final_count} (> 3000)"
 fi
 
+# ---- 5e. Round 9: EFI 全部必须 =n (否则 Image 仍是 PE, aboot 必复位) ----
+# Kconfig 对 =n 的输出形式是 "# CONFIG_X is not set", 也要认.
+# 若符号在 .config 里彻底不存在 → 该内核分支没有这个符号 (例如 arm64 没有 EFI_ARMSTUB).
+for sym in "${EFI_FORCE_OFF[@]}"; do
+  if grep -qx "# ${sym} is not set" .config || grep -qx "${sym}=n" .config; then
+    echo "  OK:   ${sym}=n"
+    continue
+  fi
+  if grep -q "^${sym}=" .config; then
+    val=$(grep "^${sym}=" .config | head -1 | cut -d= -f2)
+    echo "  FATAL: ${sym}=${val} — 强制关闭失败!"
+    # 找出谁 select 了它 (源码树就在当前 WORK_DIR 里)
+    sel=$(grep -rn --include='Kconfig*' -E \
+        "^[[:space:]]*select[[:space:]]+${sym#CONFIG_}([[:space:]]|$)" \
+        arch drivers mm security init kernel 2>/dev/null | head -5 || true)
+    if [[ -n "$sel" ]]; then
+      echo "       被以下符号 select:"
+      echo "$sel" | sed 's/^/         /'
+    else
+      echo "       未找到显式 select — 可能是 default y 或隐藏符号 (无 prompt)"
+      grep -rn --include='Kconfig*' -E "^[[:space:]]*config[[:space:]]+${sym#CONFIG_}$" \
+          arch drivers 2>/dev/null | head -5 | sed 's/^/         defined: /' || true
+    fi
+    final_fail=1
+  else
+    echo "  OK:   ${sym} absent (该内核分支没有这个符号)"
+  fi
+done
+
 # ---- 打印 fragment 里提到的所有选项的实际值 ----
 echo ""
 echo "=== Key option actual values (human audit) ==="
@@ -253,10 +294,19 @@ audit_symbols=(
   "CONFIG_MMC_SDHCI_PLTFM"            # eMMC controller
   "CONFIG_OVERLAY_FS"                 # overlayfs (Armbian needs)
   "CONFIG_EXTCON_GPIO"                # USB role detection
+  "CONFIG_EFI"                         # Round 9: 必须 n (PE 头会导致 aboot 复位)
+  "CONFIG_EFI_STUB"                    # Round 9: 必须 n
+  "CONFIG_EFI_ARMSTUB"                 # Round 9: arm64 无此符号属正常
+  "CONFIG_EFI_ZBOOT"                   # Round 9: 必须 n (否则 Image 是 EFI zboot 壳)
 )
 for sym in "${audit_symbols[@]}"; do
-  val=$(grep "^${sym}=" .config 2>/dev/null || echo "(not set / not found)")
-  echo "  ${val}"
+  if grep -q "^${sym}=" .config 2>/dev/null; then
+    echo "  $(grep "^${sym}=" .config | head -1)"
+  elif grep -qx "# ${sym} is not set" .config; then
+    echo "  ${sym}=n"
+  else
+    echo "  ${sym}=(not set / not found)"
+  fi
 done
 
 if [[ $final_fail -ne 0 ]]; then
