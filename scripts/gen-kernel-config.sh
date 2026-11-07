@@ -271,6 +271,62 @@ for sym in "${EFI_FORCE_OFF[@]}"; do
   fi
 done
 
+# ---- 5f. Round 10: 瘦身后启动链硬校验 ----
+# fragment 里写了 800+ 条 =n, 担心某个 select 把启动必需项连带关掉,
+# 这里逐个确认 (y/m 都认, 缺失或 =n 直接 fail).
+boot_critical=(
+  "CONFIG_ARCH_QCOM"
+  "CONFIG_BLK_DEV_INITRD"
+  "CONFIG_EXT4_FS"
+  "CONFIG_DEVTMPFS"
+  "CONFIG_DEVTMPFS_MOUNT"
+  "CONFIG_MMC_SDHCI_MSM"          # eMMC 控制器
+  "CONFIG_SERIAL_MSM"             # earlycon / console
+  "CONFIG_SERIAL_MSM_CONSOLE"
+  "CONFIG_PINCTRL_MSM8916"
+  "CONFIG_COMMON_CLK_QCOM"
+  "CONFIG_MSM_GCC_8916"
+  "CONFIG_QCOM_CLK_SMD_RPM"
+  "CONFIG_QCOM_SMD_RPM"
+  "CONFIG_QCOM_SMEM"
+  "CONFIG_REGULATOR_QCOM_SMD_RPM"
+  "CONFIG_REGULATOR_QCOM_SPMI"
+  "CONFIG_MFD_SPMI_PMIC"
+  "CONFIG_PINCTRL_QCOM_SPMI_PMIC"
+  "CONFIG_USB_CHIPIDEA"           # msm8916 的 USB 是 ci-hdrc, 不是 dwc3
+  "CONFIG_USB_GADGET"
+  "CONFIG_USB_CONFIGFS"
+  "CONFIG_USB_CONFIGFS_RNDIS"
+  "CONFIG_USB_CONFIGFS_ACM"
+  "CONFIG_QCOM_WCNSS_PIL"         # WiFi PIL
+  "CONFIG_RPMSG_QCOM_SMD"
+  "CONFIG_WCN36XX"                # WiFi driver
+)
+for sym in "${boot_critical[@]}"; do
+  val=$(grep "^${sym}=" .config 2>/dev/null | head -1 | cut -d= -f2 || true)
+  if [[ "$val" == "y" || "$val" == "m" ]]; then
+    echo "  OK:   ${sym}=${val}"
+  else
+    echo "  FATAL: ${sym} 未开启 (val='${val}') — 瘦身把启动必需项裁掉了!"
+    final_fail=1
+  fi
+done
+# PHY 允许 =y 或 =m
+phy_val=$(grep '^CONFIG_PHY_QCOM_USB_HS=' .config 2>/dev/null | cut -d= -f2 || true)
+if [[ "$phy_val" == "y" || "$phy_val" == "m" ]]; then
+  echo "  OK:   CONFIG_PHY_QCOM_USB_HS=${phy_val}"
+else
+  echo "  FATAL: CONFIG_PHY_QCOM_USB_HS 未开启 — USB 枚举会一直 EPROBE_DEFER"
+  final_fail=1
+fi
+# 优化级别 (只告警: 若 Image 实测 <= 26 MiB 可以回到 -O2)
+opt_val=$(grep '^CONFIG_CC_OPTIMIZE_FOR_SIZE=' .config 2>/dev/null | cut -d= -f2 || true)
+if [[ "$opt_val" == "y" ]]; then
+  echo "  OK:   CONFIG_CC_OPTIMIZE_FOR_SIZE=y (-Os, Round 10 体积兜底)"
+else
+  echo "  WARN: CONFIG_CC_OPTIMIZE_FOR_SIZE!=y — Image 可能超过 28 MiB"
+fi
+
 # ---- 打印 fragment 里提到的所有选项的实际值 ----
 echo ""
 echo "=== Key option actual values (human audit) ==="
@@ -289,6 +345,9 @@ audit_symbols=(
   "CONFIG_USB_CONFIGFS_ACM"            # ACM gadget (Kconfig L199, no F_ prefix)
   "CONFIG_REGULATOR_QCOM_SMD_RPM"     # SMD RPM regulators
   "CONFIG_SERIAL_MSM_CONSOLE"         # msm8916 UART console driver
+  "CONFIG_USB_CHIPIDEA"                # msm8916 USB (ci-hdrc)
+  "CONFIG_PHY_QCOM_USB_HS"             # msm8916 USB HS PHY
+  "CONFIG_CC_OPTIMIZE_FOR_SIZE"        # Round 10: -Os 体积兜底
   "CONFIG_SERIAL_QCOM_GENI_CONSOLE"   # GENI console (8996+)
   "CONFIG_PINCTRL_MSM8916"            # msm8916 pinctrl
   "CONFIG_MMC_SDHCI_PLTFM"            # eMMC controller
