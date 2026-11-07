@@ -610,8 +610,10 @@ jobs:
       #   kernel 段 = gzip -9 Image + dtb 拼在 gzip 流之后
       #   (aboot: is_gzip_package() → decompress() 返回 dtb_offset,
       #    之后 dev_tree_appended() 在压缩流末尾找 dtb)
-      #   header: page 2048 / kernel 0x80080000 / ramdisk 0x84000000 /
-      #           tags 0x83800000 / header_version 0
+      #   header: page 2048 / kernel 0x80080000 / ramdisk 0x82000000 /
+      #           tags 0x81E00000 / header_version 0
+      #   ^ Round 10: 三个地址改回原厂 2.1 值, 与 aboot 的固定布局完全对齐;
+      #     Image 必须 <= 28 MiB, 保证 0x80080000+28MiB = 0x81C00000 < tags 0x81E00000.
       # 内核只从构建产物取, 绝不再从 rootfs /boot/Image 取 (那是 PE 文件).
       # ============================================================
       - name: Build boot.img — AOSP v0 (gzip Image + appended dtb + initrd)
@@ -685,7 +687,11 @@ jobs:
           strings "$DTB" 2>/dev/null | grep -m3 -iE 'Handsome OpenStick|UFI003' || echo "  (model string not found — WARN only)"
 
           # ---- 3. kernel 段 = gzip -9 Image || dtb ----
-          gzip -9 -c "$KERNEL_IMG" > /tmp/Image.gz
+          # -n 去掉 FNAME/mtime, 保证 gzip 头是 1f 8b 08 00 (aboot 只认 FLG=0x00)
+          gzip -9 -n -c "$KERNEL_IMG" > /tmp/Image.gz
+          if [[ "$(head -c4 /tmp/Image.gz | od -An -tx1 | tr -d ' \n')" != "1f8b0800" ]]; then
+              echo "FATAL: gzip header is not 1f 8b 08 00"; exit 1
+          fi
           cat /tmp/Image.gz "$DTB" > /tmp/kernel-dtb.bin
           KSIZE=$(stat -c%s /tmp/kernel-dtb.bin)
           RSIZE=$(stat -c%s "$INITRD")
@@ -694,27 +700,34 @@ jobs:
           echo "  kernel_size(gz+dtb) : $KSIZE bytes"
           echo "  ramdisk_size        : $RSIZE bytes"
 
-          # ---- 4. 尺寸 / 地址硬约束 ----
-          # boot 分区 64 MiB → payload 上限 63 MiB 留余量;
-          # 裸 Image 解压后落在 0x80080000, 不能越过 tags_addr / ramdisk_addr.
+          # ---- 4. 尺寸 / 地址硬约束 (Round 10: 原厂布局) ----
+          # kernel 0x80080000 / ramdisk 0x82000000 / tags 0x81E00000, page 2048.
+          # Image 解压后落在 0x80080000, 必须 <= 28 MiB 才能落在 tags 之下.
           python3 - "$KERNEL_IMG" "$KSIZE" "$RSIZE" <<'PY'
           import os, struct, sys
 
           p, ksize, rsize = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
           h = open(p, 'rb').read(64)
           image_size = struct.unpack('<Q', h[16:24])[0]
-          kernel_addr, ramdisk_addr, tags_addr = 0x80080000, 0x84000000, 0x83800000
+          kernel_addr, ramdisk_addr, tags_addr = 0x80080000, 0x82000000, 0x81E00000
           page = 2048
+          r4 = lambda n: ((n + page - 1) // page) * page
           img_end = kernel_addr + image_size
-          total = ((page + ksize + rsize + page - 1) // page) * page
+          total = page + r4(ksize) + r4(rsize)
 
-          print("  image_size=%d (0x%x), decompressed end=0x%x" % (image_size, image_size, img_end))
-          print("  boot.img total=%d bytes (%.2f MiB)" % (total, total / 1048576.0))
+          print("  image_size=%d (%.2f MiB), decompressed end=0x%x" %
+                (image_size, image_size / 1048576.0, img_end))
+          print("  ramdisk_end=0x%x, boot.img total=%d bytes (%.2f MiB)" %
+                (ramdisk_addr + r4(rsize), total, total / 1048576.0))
           fail = []
+          if image_size > 28 * 1024 * 1024:
+              fail.append("Image %d > 28 MiB (会压到 tags 0x81E00000)" % image_size)
           if ksize + rsize > 63 * 1024 * 1024:
               fail.append("payload %d > 63 MiB" % (ksize + rsize))
-          if total > 64 * 1024 * 1024:
-              fail.append("boot.img %d > 64 MiB" % total)
+          if total > 32 * 1024 * 1024:
+              fail.append("boot.img %d > 32 MiB" % total)
+          elif total > 30 * 1024 * 1024:
+              print("  WARN: boot.img %.2f MiB > 30 MiB 目标" % (total / 1048576.0))
           if img_end >= tags_addr:
               fail.append("kernel end 0x%x >= tags_addr 0x%x" % (img_end, tags_addr))
           if img_end >= ramdisk_addr:
@@ -725,18 +738,21 @@ jobs:
           PY
 
           # ---- 5. AOSP boot v0 头 + 打包 ----
+          # kernel 段按 page 对齐, ramdisk 从 page+ROUND(kernel_size) 开始 (aboot 的读法)
           mkdir -p output/fastboot
-          python3 - /tmp/kernel-dtb.bin "$INITRD" output/fastboot/boot.img <<'PY'
+          python3 - /tmp/kernel-dtb.bin "$INITRD" output/fastboot/boot.img "$KERNEL_IMG" <<'PY'
           import struct, sys
 
-          kpath, rpath, out = sys.argv[1], sys.argv[2], sys.argv[3]
+          kpath, rpath, out, imgpath = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
           PAGE = 2048
-          KERNEL_ADDR, RAMDISK_ADDR, TAGS_ADDR = 0x80080000, 0x84000000, 0x83800000
+          KERNEL_ADDR, RAMDISK_ADDR, TAGS_ADDR = 0x80080000, 0x82000000, 0x81E00000
           CMDLINE = (b"earlycon root=PARTUUID=a7ab80e8-e9d1-e8cd-f157-93f69b1d141e "
                      b"console=ttyMSM0,115200 rootwait no_framebuffer=true rw")
 
           k = open(kpath, 'rb').read()
           r = open(rpath, 'rb').read()
+          image_size = struct.unpack('<Q', open(imgpath, 'rb').read(24)[16:24])[0]
+          r4 = lambda n: ((n + PAGE - 1) // PAGE) * PAGE
 
           hdr = struct.pack('<8s10I16s512s32s1024s',
                             b'ANDROID!',
@@ -744,18 +760,25 @@ jobs:
                             len(r), RAMDISK_ADDR,     # ramdisk_size, ramdisk_addr
                             0, 0,                     # second_size, second_addr
                             TAGS_ADDR, PAGE,
-                            0, 0,                     # header_version, os_version
+                            0, 0,                     # header_version, dt_size
                             b'UFI003', CMDLINE, b'\0' * 32, b'\0' * 1024)
           assert len(hdr) == 1632, len(hdr)
 
-          body = hdr + b'\0' * (PAGE - len(hdr)) + k + r
-          body += b'\0' * ((-len(body)) % PAGE)
+          body = hdr + b'\0' * (PAGE - len(hdr))
+          body += k + b'\0' * (r4(len(k)) - len(k))
+          body += r + b'\0' * (r4(len(r)) - len(r))
           open(out, 'wb').write(body)
 
-          print("  boot.img       : %d bytes (%.2f MiB)" % (len(body), len(body) / 1048576.0))
-          print("  kernel_size    : %d  @ 0x%x" % (len(k), KERNEL_ADDR))
-          print("  ramdisk_size   : %d  @ 0x%x" % (len(r), RAMDISK_ADDR))
-          print("  tags_addr      : 0x%x  page=%d  header_version=0" % (TAGS_ADDR, PAGE))
+          print("  --- SIZE REPORT ---")
+          print("  Image (decompressed) : %d bytes (%.2f MiB)" % (image_size, image_size / 1048576.0))
+          print("  kernel_size (gz+dtb) : %d bytes" % len(k))
+          print("  ramdisk_size         : %d bytes" % len(r))
+          print("  ramdisk_off          : %d (0x%x, 2048 对齐)" % (PAGE + r4(len(k)), PAGE + r4(len(k))))
+          print("  boot.img total       : %d bytes (%.2f MiB)" % (len(body), len(body) / 1048576.0))
+          print("  kernel_addr          : 0x%08x" % KERNEL_ADDR)
+          print("  ramdisk_addr         : 0x%08x" % RAMDISK_ADDR)
+          print("  tags_addr            : 0x%08x" % TAGS_ADDR)
+          print("  page=%d  header_version=0  dt_size=0" % PAGE)
           print("  cmdline        : %s" % CMDLINE.decode())
           PY
 
@@ -839,18 +862,22 @@ jobs:
           chk("magic == ANDROID!", magic == b'ANDROID!')
           chk("page_size == 2048", pg == 2048)
           chk("kernel_addr == 0x80080000", ka == 0x80080000)
-          chk("ramdisk_addr == 0x84000000", ra == 0x84000000)
-          chk("tags_addr == 0x83800000", ta == 0x83800000)
+          chk("ramdisk_addr == 0x82000000 (原厂)", ra == 0x82000000)
+          chk("tags_addr == 0x81E00000 (原厂)", ta == 0x81E00000)
           chk("header_version == 0", hv == 0)
           chk("second_size == 0", ss == 0)
           chk("cmdline root=PARTUUID a7ab80e8-...", "root=PARTUUID=a7ab80e8-e9d1-e8cd-f157-93f69b1d141e" in cmd)
           chk("cmdline 不再依赖 by-partlabel/udev", "by-partlabel" not in cmd)
           chk("payload <= 63 MiB", ks + rs <= 63 * 1024 * 1024)
-          chk("boot.img <= 64 MiB", len(d) <= 64 * 1024 * 1024)
+          chk("boot.img <= 30 MiB (目标)", len(d) <= 30 * 1024 * 1024)
+          chk("boot.img <= 32 MiB (硬上限)", len(d) <= 32 * 1024 * 1024)
 
+          r4 = lambda n: ((n + pg - 1) // pg) * pg
           kseg = d[pg:pg + ks]
-          rseg = d[pg + ks:pg + ks + rs]
+          rseg = d[pg + r4(ks):pg + r4(ks) + rs]
+          chk("gzip 头 == 1f 8b 08 00 (无 FNAME)", kseg[:4] == b'\x1f\x8b\x08\x00')
           chk("initrd 段长度正确且非空", len(rseg) == rs and rs > 0)
+          chk("ramdisk 偏移页对齐", (pg + r4(ks)) % pg == 0)
           chk("kernel 段含 dtb magic", b'\xd0\x0d\xfe\xed' in kseg)
 
           try:
@@ -863,9 +890,16 @@ jobs:
           w0 = struct.unpack('<I', dec[:4])[0] if len(dec) >= 4 else 0
           dsize = struct.unpack('<Q', dec[16:24])[0] if len(dec) >= 24 else 0
           print("  gzip payload decompressed: %d bytes, code0=0x%08x, image_size=0x%x" % (len(dec), w0, dsize))
+          print("  --- SIZE REPORT (boot.img) ---")
+          print("  Image (decompressed) : %d bytes (%.2f MiB)" % (len(dec), len(dec) / 1048576.0))
+          print("  kernel_size (gz+dtb) : %d bytes" % ks)
+          print("  boot.img total       : %d bytes (%.2f MiB)" % (len(d), len(d) / 1048576.0))
+          print("  addrs: kernel=0x%08x ramdisk=0x%08x tags=0x%08x page=%d" % (ka, ra, ta, pg))
           chk("gzip kernel 可解压", len(dec) > 0)
           chk("解压后 code0 == d503201f", w0 == 0xd503201f)
           chk("解压后 image_size > 0", dsize > 0)
+          chk("Image <= 28 MiB (地址约束)", len(dec) <= 28 * 1024 * 1024)
+          chk("kernel 末端 0x%x < tags 0x81E00000" % (ka + len(dec)), ka + len(dec) < 0x81E00000)
           # image_size 可大于实际解压长度 (含 bss), 允许 32MiB 内差异
           chk("image_size 与实际解压长度相差 <= 32MiB", abs(dsize - len(dec)) <= 32 * 1024 * 1024)
 
