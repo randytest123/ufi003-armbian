@@ -79,6 +79,10 @@ concurrency:
 env:
   BOARD: ufi003
   KERNEL_CONFIGURE: no
+  # Round 10b: armbian_kernel_config__600_enable_ebpf_and_btf_info() 在 KERNEL_BTF!=no 时
+  # 会强制 DEBUG_INFO / DEBUG_INFO_DWARF5 / DEBUG_INFO_BTF / DEBUG_INFO_BTF_MODULES=y.
+  # .BTF 是 alloc 段, 会直接进 arm64 Image, 体积暴涨. 我们只需要 <= 28 MiB, 不要 BTF/CO-RE.
+  KERNEL_BTF: "no"
   EXPERT: no
   # Round 5: 关掉 xz 压缩 — armbian 的 compress-checksum.sh 用子串匹配 (*xz* / *zst* / *sha*),
   # 空值 = 不压缩不校验, 直接留下 .img 原文件, 省掉一份全尺寸临时文件 + xz 工作内存.
@@ -135,14 +139,15 @@ jobs:
               "${ARMBIAN_BUILD_DIR}/config/boards" \
               "${ARMBIAN_BUILD_DIR}/config/sources/families" \
               "${ARMBIAN_BUILD_DIR}/config/bootscripts" \
-              "${ARMBIAN_BUILD_DIR}/config/sections" \
               "${ARMBIAN_BUILD_DIR}/userpatches/kernel" \
               "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12"
 
           cp config/boards/ufi003.csc                 "${ARMBIAN_BUILD_DIR}/config/boards/"
           cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
           cp config/bootscripts/bootscript-msm8916.sh  "${ARMBIAN_BUILD_DIR}/config/bootscripts/"
-          cp config/sections/msm8916.config           "${ARMBIAN_BUILD_DIR}/config/sections/"
+          # Round 10b: config/sections 不是 armbian 的读取路径, 这行 cp 是死代码,
+          # msm8916.config 只作为 gen-kernel-config.sh 的 --fragment 输入,
+          # 最终生效的是 userpatches/linux-msm8916-current.config (优先级 1).
           cp scripts/gen-kernel-config.sh             "${ARMBIAN_BUILD_DIR}/scripts/" 2>/dev/null || true
           # patch 放根目录 (无害, 不会被扫) + 真正生效的位置
           cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
@@ -234,7 +239,6 @@ jobs:
               "${ARMBIAN_BUILD_DIR}/config/boards" \
               "${ARMBIAN_BUILD_DIR}/config/sources/families" \
               "${ARMBIAN_BUILD_DIR}/config/bootscripts" \
-              "${ARMBIAN_BUILD_DIR}/config/sections" \
               "${ARMBIAN_BUILD_DIR}/userpatches/kernel" \
               "${ARMBIAN_BUILD_DIR}/userpatches/kernel/archive/msm8916-6.12" \
               "${ARMBIAN_BUILD_DIR}/userpatches/config/kernel"
@@ -242,7 +246,8 @@ jobs:
           cp config/boards/ufi003.csc                 "${ARMBIAN_BUILD_DIR}/config/boards/"
           cp config/sources/families/msm8916.conf     "${ARMBIAN_BUILD_DIR}/config/sources/families/"
           cp config/bootscripts/bootscript-msm8916.sh  "${ARMBIAN_BUILD_DIR}/config/bootscripts/"
-          cp config/sections/msm8916.config           "${ARMBIAN_BUILD_DIR}/config/sections/"
+          # Round 10b: config/sections 不是 armbian 的读取路径, 不往 armbian 里拷;
+          # 它只作为 gen-kernel-config.sh 的 --fragment 输入.
           # patch 放根目录 (无害, 不会被扫) + 真正生效的位置
           cp userpatches/kernel/add-openstick-dts-ufi003-nomodem.patch \
              "${ARMBIAN_BUILD_DIR}/userpatches/kernel/"
@@ -388,6 +393,68 @@ jobs:
           echo "exit_code=0"              >> "$GITHUB_OUTPUT"
           echo "elapsed_minutes=${ELAPSED}" >> "$GITHUB_OUTPUT"
           echo "compile.sh OK, ${IMG_COUNT} img files produced"
+
+      # ============================================================
+      # Round 10b: 内核 .config 自证 (只读, 不改门禁)
+      # 1) 证明 fragment 真的进了最终内核 config (路径/SHA256/行数/计数/抽查)
+      # 2) 打印 vmlinux 最大的 alloc 段, 下一轮按实测数据决定裁哪里
+      # ============================================================
+      - name: Attest kernel .config + top alloc sections
+        run: |
+          set -euo pipefail
+          CFG=$(find "${ARMBIAN_BUILD_DIR}/cache/sources" -maxdepth 6 -type f -name ".config" -path "*linux-kernel-worktree*" | head -1)
+          if [[ -z "${CFG}" ]]; then
+              echo "FATAL: kernel .config not found under cache/sources"; exit 1
+          fi
+          echo "=== kernel .config actually used ==="
+          echo "path    : ${CFG}"
+          echo "sha256  : $(sha256sum "${CFG}" | cut -d' ' -f1)"
+          echo "lines   : $(wc -l < "${CFG}")"
+          echo "=y      : $(grep -c '^CONFIG_[A-Z0-9_]*=y' "${CFG}")"
+          echo "=m      : $(grep -c '^CONFIG_[A-Z0-9_]*=m' "${CFG}")"
+          echo "not-set : $(grep -c '^# CONFIG_[A-Z0-9_]* is not set' "${CFG}")"
+          echo ""
+          echo "=== spot checks ==="
+          for s in CONFIG_CC_OPTIMIZE_FOR_SIZE CONFIG_DEBUG_KERNEL CONFIG_DEBUG_INFO \
+                   CONFIG_DEBUG_INFO_DWARF5 CONFIG_DEBUG_INFO_BTF CONFIG_DEBUG_INFO_BTF_MODULES \
+                   CONFIG_EFI CONFIG_EFI_STUB CONFIG_ARM64_EFI_ZBOOT \
+                   CONFIG_PHY_QCOM_USB_HS CONFIG_USB_CHIPIDEA CONFIG_USB_CHIPIDEA_UDC \
+                   CONFIG_USB_CHIPIDEA_MSM CONFIG_USB_GADGET CONFIG_USB_CONFIGFS \
+                   CONFIG_USB_CONFIGFS_RNDIS CONFIG_USB_CONFIGFS_ACM \
+                   CONFIG_ARM64_VA_BITS CONFIG_ARM64_PA_BITS; do
+              v=$(grep -E "^${s}=" "${CFG}" || true)
+              if [[ -z "${v}" ]]; then v=$(grep -E "^# ${s} is not set" "${CFG}" || true); fi
+              if [[ -z "${v}" ]]; then v="(absent)"; fi
+              echo "  ${s} -> ${v}"
+          done
+          echo ""
+          echo "=== HARD ASSERT ==="
+          grep -q '^CONFIG_CC_OPTIMIZE_FOR_SIZE=y' "${CFG}" \
+              || { echo "FATAL: CONFIG_CC_OPTIMIZE_FOR_SIZE != y (-Os 没进最终 config)"; exit 1; }
+          if grep -q '^CONFIG_DEBUG_INFO_BTF=y' "${CFG}"; then
+              echo "FATAL: CONFIG_DEBUG_INFO_BTF=y (KERNEL_BTF=no 没生效)"; exit 1
+          fi
+          echo "OK: -Os=y, BTF off"
+          echo ""
+          echo "=== Round 11 HARD ASSERT (USB 全内建 + 48-bit VA) ==="
+          for s in CONFIG_PHY_QCOM_USB_HS CONFIG_USB_CHIPIDEA CONFIG_USB_CHIPIDEA_UDC \
+                   CONFIG_USB_CHIPIDEA_MSM CONFIG_USB_GADGET CONFIG_USB_CONFIGFS \
+                   CONFIG_USB_CONFIGFS_RNDIS CONFIG_USB_CONFIGFS_ACM; do
+              grep -q "^${s}=y" "${CFG}" \
+                  || { echo "FATAL: ${s} != y (USB 未内建, 开机早期不会有网卡)"; exit 1; }
+          done
+          grep -q '^CONFIG_ARM64_VA_BITS=48' "${CFG}" \
+              || { echo "FATAL: CONFIG_ARM64_VA_BITS != 48 (未对齐原厂 2.1)"; exit 1; }
+          echo "OK: USB all =y, VA_BITS=48"
+          echo ""
+          echo "=== vmlinux top alloc sections ==="
+          VMLINUX=$(find "${ARMBIAN_BUILD_DIR}/cache/sources" -maxdepth 6 -type f -name "vmlinux" -path "*linux-kernel-worktree*" | head -1)
+          if [[ -n "${VMLINUX}" ]]; then
+              echo "vmlinux : ${VMLINUX} ($(stat -c%s "${VMLINUX}") B)"
+              readelf -SW "${VMLINUX}" | python3 -c "import re,sys; L=[re.match(r'\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+(\S+)\s+(\S+)', l) for l in sys.stdin]; R=sorted([(int(m.group(5),16), m.group(1), m.group(2)) for m in L if m and 'A' in m.group(7)], reverse=True); print('  alloc total: %.2f MiB in %d sections' % (sum(x[0] for x in R)/1048576.0, len(R))); [print('  %10.2f MiB  %-24s %s' % (x[0]/1048576.0, x[1], x[2])) for x in R[:12]]"
+          else
+              echo "WARN: vmlinux not found, skip section dump"
+          fi
 
       # ============================================================
       # Round 9 (A): 定位构建产物里的裸 arm64 Image + 硬断言
