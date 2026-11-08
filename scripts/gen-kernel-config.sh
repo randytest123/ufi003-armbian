@@ -311,13 +311,69 @@ for sym in "${boot_critical[@]}"; do
     final_fail=1
   fi
 done
-# PHY 允许 =y 或 =m
-phy_val=$(grep '^CONFIG_PHY_QCOM_USB_HS=' .config 2>/dev/null | cut -d= -f2 || true)
-if [[ "$phy_val" == "y" || "$phy_val" == "m" ]]; then
-  echo "  OK:   CONFIG_PHY_QCOM_USB_HS=${phy_val}"
+# ---- 5g. Round 11: USB 全内建 + arm64 位宽硬校验 (不允许静默降级) ----
+# 目标: USB PHY / chipidea / gadget / configfs 全部 =y, 不依赖 initramfs 加载;
+#       arm64 VA/PA 位宽对齐原厂 2.1 的 48/48.
+# 上一版内核实测 PHY_QCOM_USB_HS=m / USB_CONFIGFS=m, 结果 UDC 与 RNDIS 全部
+# 要等 userspace 加载模块, 开机早期网卡不存在. 这里把"必须 =y"钉死:
+# olddefconfig 若把它们改回 =m/=n, 直接 fail, 不打印 WARN 放行.
+usb_strict_y=(
+  "CONFIG_PHY_QCOM_USB_HS"        # USB HS PHY (dtb: qcom,usb-hs-phy-msm8916)
+  "CONFIG_USB_CHIPIDEA"           # ci-hdrc 控制器
+  "CONFIG_USB_CHIPIDEA_UDC"       # gadget 侧的 UDC
+  "CONFIG_USB_CHIPIDEA_MSM"       # msm8916 glue (devicetree 节点驱动)
+  "CONFIG_USB_GADGET"             # gadget 框架
+  "CONFIG_USB_CONFIGFS"           # configfs gadget (RNDIS/ACM 的挂载点)
+  "CONFIG_USB_CONFIGFS_RNDIS"     # USB 网卡
+  "CONFIG_USB_CONFIGFS_ACM"       # 串口
+)
+for sym in "${usb_strict_y[@]}"; do
+  val=$(grep "^${sym}=" .config 2>/dev/null | head -1 | cut -d= -f2 || true)
+  if [[ "$val" == "y" ]]; then
+    echo "  OK:   ${sym}=y"
+  else
+    echo "  FATAL: ${sym} 必须 =y, 实际 val='${val}'!"
+    echo "        检查 fragment 里该行是否被后写的 =m/=n 覆盖, 或 Kconfig 依赖被裁. "
+    # 找出谁把它是 select / depends 拖下来的 (源码树就在当前 WORK_DIR 里)
+    def=$(grep -rn --include='Kconfig*' -E \
+        "^[[:space:]]*config[[:space:]]+${sym#CONFIG_}$" arch drivers 2>/dev/null | head -3 || true)
+    if [[ -n "$def" ]]; then
+      echo "       定义位置:"
+      echo "$def" | sed 's/^/         /'
+    fi
+    final_fail=1
+  fi
+done
+
+# ---- 5h. Round 11: arm64 VA/PA 必须是 48 (对齐原厂 2.1) ----
+va_val=$(grep '^CONFIG_ARM64_VA_BITS=' .config 2>/dev/null | cut -d= -f2 || true)
+if [[ "$va_val" == "48" ]]; then
+  echo "  OK:   CONFIG_ARM64_VA_BITS=48"
 else
-  echo "  FATAL: CONFIG_PHY_QCOM_USB_HS 未开启 — USB 枚举会一直 EPROBE_DEFER"
+  echo "  FATAL: CONFIG_ARM64_VA_BITS 应为 48, 实际 val='${va_val}'!"
+  echo "        检查 fragment 的 CONFIG_ARM64_VA_BITS_48=y / _52=n 是否被覆盖."
   final_fail=1
+fi
+if grep -q '^CONFIG_ARM64_VA_BITS_52=y' .config; then
+  echo "  FATAL: CONFIG_ARM64_VA_BITS_52=y (48 位没生效!)"
+  final_fail=1
+fi
+pa_val=$(grep '^CONFIG_ARM64_PA_BITS=' .config 2>/dev/null | cut -d= -f2 || true)
+if [[ "$pa_val" == "48" ]]; then
+  echo "  OK:   CONFIG_ARM64_PA_BITS=48"
+elif [[ -z "$pa_val" ]]; then
+  echo "  WARN: CONFIG_ARM64_PA_BITS 不存在 (该内核分支无此符号)"
+else
+  echo "  FATAL: CONFIG_ARM64_PA_BITS 应为 48, 实际 val='${pa_val}'!"
+  final_fail=1
+fi
+
+# ---- 5i. Round 11: BTF 在本阶段必须未开启 (最终以 workflow attest 为准) ----
+if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then
+  echo "  FATAL: CONFIG_DEBUG_INFO_BTF=y — .BTF 是 alloc 段, 会直接进 Image"
+  final_fail=1
+else
+  echo "  OK:   CONFIG_DEBUG_INFO_BTF 未开启 (KERNEL_BTF=no 由 workflow 保证)"
 fi
 # 优化级别 (只告警: 若 Image 实测 <= 26 MiB 可以回到 -O2)
 opt_val=$(grep '^CONFIG_CC_OPTIMIZE_FOR_SIZE=' .config 2>/dev/null | cut -d= -f2 || true)
@@ -346,7 +402,11 @@ audit_symbols=(
   "CONFIG_REGULATOR_QCOM_SMD_RPM"     # SMD RPM regulators
   "CONFIG_SERIAL_MSM_CONSOLE"         # msm8916 UART console driver
   "CONFIG_USB_CHIPIDEA"                # msm8916 USB (ci-hdrc)
-  "CONFIG_PHY_QCOM_USB_HS"             # msm8916 USB HS PHY
+  "CONFIG_USB_CHIPIDEA_UDC"            # Round 11: gadget 侧 UDC 必须 =y
+  "CONFIG_USB_CHIPIDEA_MSM"            # Round 11: msm8916 glue 必须 =y
+  "CONFIG_PHY_QCOM_USB_HS"             # msm8916 USB HS PHY (Round 11: 必须 =y)
+  "CONFIG_ARM64_VA_BITS"               # Round 11: 必须 48 (对齐原厂)
+  "CONFIG_ARM64_PA_BITS"               # Round 11: 必须 48 (对齐原厂)
   "CONFIG_CC_OPTIMIZE_FOR_SIZE"        # Round 10: -Os 体积兜底
   "CONFIG_SERIAL_QCOM_GENI_CONSOLE"   # GENI console (8996+)
   "CONFIG_PINCTRL_MSM8916"            # msm8916 pinctrl
