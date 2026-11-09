@@ -51,6 +51,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Round 12 fix: 记录启动时的 cwd, 并把 --fragment 转成绝对路径.
+# 本脚本后面会 cd 到 mktemp 出来的内核源码树 (linux-src), 从 workflow 传进来的
+# 相对路径 "config/sections/msm8916.config" 在那边根本不存在 —— 之前的版本
+# 就是因此静默跳过 fragment, 导致所有钉住的 =y / VA_BITS=48 全部没生效.
+SCRIPT_START_PWD="$PWD"
+if [[ -n "$FRAGMENT" && "$FRAGMENT" != /* ]]; then
+  FRAGMENT="$SCRIPT_START_PWD/$FRAGMENT"
+fi
+
 if [[ -z "$BRANCH" || ${#OUTPUT_DIRS[@]} -eq 0 ]]; then
   cat <<'USAGE'
 Usage: gen-kernel-config.sh --branch <current|edge> --fragment <file> --output-dir <dir> [--output-dir <dir2> ...]
@@ -154,12 +163,22 @@ echo ""
 # Step 4: merge fragment + make olddefconfig
 # =========================================================================
 echo "=== Step 4/5: Merge fragment + make olddefconfig ==="
-if [[ -n "$FRAGMENT" && -f "$FRAGMENT" ]]; then
+if [[ -n "$FRAGMENT" ]]; then
+  if [[ ! -f "$FRAGMENT" ]]; then
+    # 指定了 fragment 却找不到, 不能静默跳过 —— 否则等于用纯 defconfig 出包,
+    # 所有钉住的选项 (USB 内建 / VA_BITS / -Os) 都不会生效, 而且下游看不出来.
+    echo "  FATAL: --fragment 指定的文件不存在: $FRAGMENT"
+    echo "         脚本启动 cwd = $SCRIPT_START_PWD"
+    echo "         请确认 workflow 传的路径相对于仓库根目录真实存在."
+    exit 2
+  fi
   echo "  Fragment file: $FRAGMENT ($(grep -cE '^CONFIG_[A-Z0-9_]+=(y|m|n)' "$FRAGMENT") valid CONFIG_ lines)"
   # 只追加 CONFIG_ 开头的有效三态配置行 (y/m/n)
   grep -E '^CONFIG_[A-Z0-9_]+=(y|m|n)' "$FRAGMENT" >> .config
+  echo "  Appended $(grep -cE '^CONFIG_[A-Z0-9_]+=(y|m|n)' "$FRAGMENT") fragment lines to .config"
 else
-  echo "  (No fragment provided or file not found)"
+  echo "  FATAL: 未指定 --fragment (本构建必须带 fragment)"
+  exit 2
 fi
 
 # ---- Round 9: 强制关闭 EFI/EFI_STUB (Qualcomm aboot 只认裸 Image) ----
@@ -204,6 +223,25 @@ echo "  Final .config: ${final_lines} lines, ${final_count} CONFIG_ entries"
 
 final_fail=0
 
+# ---- Round 12: 三态读取器 ----
+# 区分 CONFIG_X=y / CONFIG_X=m / # CONFIG_X is not set (=n) / 符号根本不存在.
+# 之前的 val=$(grep "^SYM=") 把 "is not set" 和 "不存在" 都当成空字符串,
+# 报错时看不出到底是哪一种.
+cfg_state() {
+  local s="$1"
+  if grep -qx "# ${s} is not set" .config 2>/dev/null; then echo "n"; return; fi
+  local v
+  v=$(grep "^${s}=" .config 2>/dev/null | head -1 | cut -d= -f2 || true)
+  if [[ -n "$v" ]]; then echo "$v"; else echo "ABSENT"; fi
+}
+
+# 打印符号在 Kconfig 里的定义位置 (失败时附带)
+kdef() {
+  local s="${1#CONFIG_}"
+  grep -rn --include='Kconfig*' -E "^[[:space:]]*config[[:space:]]+${s}$" \
+      arch drivers mm security init kernel block net sound 2>/dev/null | head -3 || true
+}
+
 # ---- 5a. CONFIG_ARCH_QCOM=y ----
 if grep -q '^CONFIG_ARCH_QCOM=y' .config; then
   echo "  OK:   CONFIG_ARCH_QCOM=y"
@@ -221,13 +259,13 @@ else
 fi
 
 # ---- 5c. CONFIG_WCN36XX 必须 =m 或 =y ----
-wcn36xx_val=$(grep '^CONFIG_WCN36XX=' .config 2>/dev/null | cut -d= -f2 || echo "")
+wcn36xx_val=$(cfg_state CONFIG_WCN36XX)
 if [[ "$wcn36xx_val" == "m" || "$wcn36xx_val" == "y" ]]; then
   echo "  OK:   CONFIG_WCN36XX=${wcn36xx_val}  (WiFi driver — 命脉项!)"
 else
-  echo "  FATAL: CONFIG_WCN36XX is not enabled (val='${wcn36xx_val}')"
+  echo "  FATAL: CONFIG_WCN36XX 期望 y|m, 实际=${wcn36xx_val}"
   echo "        WCN3620 WiFi is the primary wireless interface — cannot be disabled!"
-  echo "        Check fragment: is CONFIG_WCN36XX=m present? Did olddefconfig reject it?"
+  kdef CONFIG_WCN36XX | sed 's/^/         defined: /'
   final_fail=1
 fi
 
@@ -303,11 +341,12 @@ boot_critical=(
   "CONFIG_WCN36XX"                # WiFi driver
 )
 for sym in "${boot_critical[@]}"; do
-  val=$(grep "^${sym}=" .config 2>/dev/null | head -1 | cut -d= -f2 || true)
+  val=$(cfg_state "$sym")
   if [[ "$val" == "y" || "$val" == "m" ]]; then
     echo "  OK:   ${sym}=${val}"
   else
-    echo "  FATAL: ${sym} 未开启 (val='${val}') — 瘦身把启动必需项裁掉了!"
+    echo "  FATAL: ${sym} 期望 y|m, 实际=${val} — 瘦身把启动必需项裁掉了!"
+    kdef "$sym" | sed 's/^/         defined: /'
     final_fail=1
   fi
 done
@@ -328,59 +367,64 @@ usb_strict_y=(
   "CONFIG_USB_CONFIGFS_ACM"       # 串口
 )
 for sym in "${usb_strict_y[@]}"; do
-  val=$(grep "^${sym}=" .config 2>/dev/null | head -1 | cut -d= -f2 || true)
+  val=$(cfg_state "$sym")
   if [[ "$val" == "y" ]]; then
     echo "  OK:   ${sym}=y"
   else
-    echo "  FATAL: ${sym} 必须 =y, 实际 val='${val}'!"
-    echo "        检查 fragment 里该行是否被后写的 =m/=n 覆盖, 或 Kconfig 依赖被裁. "
-    # 找出谁把它是 select / depends 拖下来的 (源码树就在当前 WORK_DIR 里)
-    def=$(grep -rn --include='Kconfig*' -E \
-        "^[[:space:]]*config[[:space:]]+${sym#CONFIG_}$" arch drivers 2>/dev/null | head -3 || true)
-    if [[ -n "$def" ]]; then
-      echo "       定义位置:"
-      echo "$def" | sed 's/^/         /'
-    fi
+    # 三种实际状态都要能区分: =m / =n(即 "# ... is not set") / ABSENT(该分支无此符号)
+    case "$val" in
+      m)       why="被 Kconfig 依赖或 select 降级成模块 (=m)" ;;
+      n)       why="被 olddefconfig 反选成 =n (依赖未满足或被 select 限制)" ;;
+      ABSENT)  why="该内核分支没有这个符号 (Kconfig 里不存在), 检查 kernel 版本/命名" ;;
+      *)       why="非预期值" ;;
+    esac
+    echo "  FATAL: ${sym} 期望 y, 实际=${val} — ${why}"
+    echo "        检查 fragment: 该符号在 msm8916.config 里是否 =y 且没有被后面的行覆盖."
+    kdef "$sym" | sed 's/^/         defined: /'
     final_fail=1
   fi
 done
 
 # ---- 5h. Round 11: arm64 VA/PA 必须是 48 (对齐原厂 2.1) ----
-va_val=$(grep '^CONFIG_ARM64_VA_BITS=' .config 2>/dev/null | cut -d= -f2 || true)
+va_val=$(cfg_state CONFIG_ARM64_VA_BITS)
 if [[ "$va_val" == "48" ]]; then
   echo "  OK:   CONFIG_ARM64_VA_BITS=48"
 else
-  echo "  FATAL: CONFIG_ARM64_VA_BITS 应为 48, 实际 val='${va_val}'!"
-  echo "        检查 fragment 的 CONFIG_ARM64_VA_BITS_48=y / _52=n 是否被覆盖."
+  echo "  FATAL: CONFIG_ARM64_VA_BITS 期望 48, 实际=${va_val}"
+  echo "        fragment 必须同时有 CONFIG_ARM64_VA_BITS_48=y 和 CONFIG_ARM64_VA_BITS_52=n."
   final_fail=1
 fi
-if grep -q '^CONFIG_ARM64_VA_BITS_52=y' .config; then
+va52_val=$(cfg_state CONFIG_ARM64_VA_BITS_52)
+if [[ "$va52_val" == "y" ]]; then
   echo "  FATAL: CONFIG_ARM64_VA_BITS_52=y (48 位没生效!)"
   final_fail=1
+else
+  echo "  OK:   CONFIG_ARM64_VA_BITS_52=${va52_val}"
 fi
-pa_val=$(grep '^CONFIG_ARM64_PA_BITS=' .config 2>/dev/null | cut -d= -f2 || true)
+pa_val=$(cfg_state CONFIG_ARM64_PA_BITS)
 if [[ "$pa_val" == "48" ]]; then
   echo "  OK:   CONFIG_ARM64_PA_BITS=48"
-elif [[ -z "$pa_val" ]]; then
+elif [[ "$pa_val" == "ABSENT" ]]; then
   echo "  WARN: CONFIG_ARM64_PA_BITS 不存在 (该内核分支无此符号)"
 else
-  echo "  FATAL: CONFIG_ARM64_PA_BITS 应为 48, 实际 val='${pa_val}'!"
+  echo "  FATAL: CONFIG_ARM64_PA_BITS 期望 48, 实际=${pa_val}"
   final_fail=1
 fi
 
 # ---- 5i. Round 11: BTF 在本阶段必须未开启 (最终以 workflow attest 为准) ----
-if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then
+btf_val=$(cfg_state CONFIG_DEBUG_INFO_BTF)
+if [[ "$btf_val" == "y" ]]; then
   echo "  FATAL: CONFIG_DEBUG_INFO_BTF=y — .BTF 是 alloc 段, 会直接进 Image"
   final_fail=1
 else
-  echo "  OK:   CONFIG_DEBUG_INFO_BTF 未开启 (KERNEL_BTF=no 由 workflow 保证)"
+  echo "  OK:   CONFIG_DEBUG_INFO_BTF=${btf_val} (KERNEL_BTF=no 由 workflow 保证)"
 fi
 # 优化级别 (只告警: 若 Image 实测 <= 26 MiB 可以回到 -O2)
-opt_val=$(grep '^CONFIG_CC_OPTIMIZE_FOR_SIZE=' .config 2>/dev/null | cut -d= -f2 || true)
+opt_val=$(cfg_state CONFIG_CC_OPTIMIZE_FOR_SIZE)
 if [[ "$opt_val" == "y" ]]; then
   echo "  OK:   CONFIG_CC_OPTIMIZE_FOR_SIZE=y (-Os, Round 10 体积兜底)"
 else
-  echo "  WARN: CONFIG_CC_OPTIMIZE_FOR_SIZE!=y — Image 可能超过 28 MiB"
+  echo "  WARN: CONFIG_CC_OPTIMIZE_FOR_SIZE=${opt_val} — Image 可能超过 28 MiB"
 fi
 
 # ---- 打印 fragment 里提到的所有选项的实际值 ----
